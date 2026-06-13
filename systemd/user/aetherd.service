@@ -5,6 +5,7 @@ Documentation=https://github.com/Gwolfgit/aethershell
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/aetherd
+ExecReload=/usr/local/bin/aether --upgrade-daemon
 Restart=on-failure
 RestartSec=1s
 

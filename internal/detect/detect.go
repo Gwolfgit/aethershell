@@ -46,6 +46,14 @@ func Detect(pid int) proto.AgentInfo {
 		return info
 	}
 
+	// If the foreground process is the shell itself, the session is idle. Do
+	// not walk above it: aetherd may have been launched from another agent, and
+	// that parent process must not label this shell session.
+	if shellCommands[comm] {
+		info.Title = "shell"
+		return info
+	}
+
 	// Walk the process tree upward from pid to find an agent ancestor.
 	agentType, agentComm := walkUp(pid)
 	if agentType != "" {
@@ -241,18 +249,19 @@ func matchCmdline(pid int) (string, string) {
 
 	// Common agent CLI patterns
 	patterns := map[string][]string{
-		"claude":    {"claude", "claude-code", "anthropic"},
-		"gemini":    {"gemini", "gemini-cli", "google-gemini"},
-		"deepcode":  {"deepcode", "deep-code"},
-		"codex":     {"codex", "openai-codex"},
-		"cursor":    {"cursor", "cursor-agent"},
-		"copilot":   {"github-copilot", "copilot"},
-		"windsurf":  {"windsurf"},
-		"cody":      {"cody", "sourcegraph"},
-		"aider":     {"aider"},
-		"devin":     {"devin"},
-		"openhands": {"openhands"},
-		"swe-agent": {"swe-agent", "sweagent"},
+		"claude":     {"claude", "claude-code", "anthropic"},
+		"gemini":     {"gemini", "gemini-cli", "google-gemini"},
+		"deepcode":   {"deepcode", "deep-code"},
+		"codex":      {"codex", "openai-codex"},
+		"perplexity": {"perplexity", "pplx"},
+		"cursor":     {"cursor", "cursor-agent"},
+		"copilot":    {"github-copilot", "copilot"},
+		"windsurf":   {"windsurf"},
+		"cody":       {"cody", "sourcegraph"},
+		"aider":      {"aider"},
+		"devin":      {"devin"},
+		"openhands":  {"openhands"},
+		"swe-agent":  {"swe-agent", "sweagent"},
 	}
 
 	for agentType, keywords := range patterns {

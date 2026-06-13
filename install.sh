@@ -132,7 +132,8 @@ env var through on BOTH ends:
 
 Daemon management:
   systemctl --user start aetherd.service
-  systemctl --user restart aetherd.service
+  systemctl --user reload aetherd.service   # hot-upgrade without killing sessions
+  systemctl --user restart aetherd.service  # kills existing PTY sessions
   journalctl --user -u aetherd.service
 
 How it works:

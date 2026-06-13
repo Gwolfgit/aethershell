@@ -186,10 +186,16 @@ func (s *Session) PtsName() string {
 
 // IsAlive reports whether the session's shell process is still usable.
 func (s *Session) IsAlive() bool {
-	if s.cmd == nil || s.cmd.Process == nil {
+	pid := s.shellPid
+	if pid <= 0 {
+		if s.cmd == nil || s.cmd.Process == nil {
+			return false
+		}
+		pid = s.cmd.Process.Pid
+	}
+	if pid <= 0 {
 		return false
 	}
-	pid := s.cmd.Process.Pid
 	if err := syscall.Kill(pid, 0); err != nil {
 		return false
 	}
@@ -262,10 +268,7 @@ func (s *Session) ForegroundPID() int {
 
 // Kill destroys the session: kills the shell process and closes the PTY.
 func (s *Session) Kill() {
-	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Signal(syscall.SIGKILL)
-		s.cmd.Process.Wait()
-	}
+	s.killShell()
 	s.pty.Close()
 }
 
@@ -287,10 +290,7 @@ func (s *Session) RestartShell() error {
 	defer slave.Close()
 
 	// Kill the old shell
-	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Signal(syscall.SIGKILL)
-		s.cmd.Process.Wait()
-	}
+	s.killShell()
 
 	// Start a new shell connected to the PTY slave
 	cmd := exec.Command("/bin/bash")
@@ -317,4 +317,15 @@ func (s *Session) RestartShell() error {
 	s.cmd = cmd
 	s.shellPid = cmd.Process.Pid
 	return nil
+}
+
+func (s *Session) killShell() {
+	if s.cmd != nil && s.cmd.Process != nil {
+		s.cmd.Process.Signal(syscall.SIGKILL)
+		s.cmd.Process.Wait()
+		return
+	}
+	if s.shellPid > 0 {
+		_ = syscall.Kill(s.shellPid, syscall.SIGKILL)
+	}
 }

@@ -114,6 +114,12 @@ func (c *Client) RestartAllSessions() error {
 	return c.sendSimple("restart_all", "")
 }
 
+// UpgradeDaemon asks a running daemon to exec the current aetherd binary while
+// handing off its listener and PTY file descriptors so sessions survive.
+func (c *Client) UpgradeDaemon() error {
+	return c.sendSimple("upgrade", "")
+}
+
 func (c *Client) sendSimple(reqType, name string) error {
 	conn, err := net.Dial("unix", c.socketPath)
 	if err != nil {

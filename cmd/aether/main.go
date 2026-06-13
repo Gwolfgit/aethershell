@@ -21,6 +21,7 @@
 //	aether --list               # list sessions (for scripting)
 //	aether --kill <name>        # kill a session
 //	aether --takeover <name>    # force-attach a stale busy session
+//	aether --upgrade-daemon     # hot-upgrade aetherd without killing sessions
 //	aether --version            # print version
 package main
 
@@ -78,6 +79,12 @@ func main() {
 	// --takeover <name>
 	if len(os.Args) > 2 && os.Args[1] == "--takeover" {
 		cmdTakeover(os.Args[2])
+		return
+	}
+
+	// --upgrade-daemon
+	if len(os.Args) > 1 && os.Args[1] == "--upgrade-daemon" {
+		cmdUpgradeDaemon()
 		return
 	}
 
@@ -457,6 +464,15 @@ func cmdKill(name string) {
 		os.Exit(1)
 	}
 	fmt.Printf("killed session %q\n", name)
+}
+
+func cmdUpgradeDaemon() {
+	c := client.NewClient(socketPath())
+	if err := c.UpgradeDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "aether: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("aetherd hot-upgraded")
 }
 
 func freeSessions(sessions []proto.Session) []string {

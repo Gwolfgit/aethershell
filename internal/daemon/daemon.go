@@ -7,9 +7,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,13 +19,19 @@ import (
 
 	"github.com/Gwolfgit/aethershell/internal/detect"
 	"github.com/Gwolfgit/aethershell/internal/proto"
+	"github.com/Gwolfgit/aethershell/internal/sessiontitle"
+	"golang.org/x/sys/unix"
 )
 
 // Server is the aether daemon: manages PTY sessions and serves client
 // connections over a Unix domain socket.
 type Server struct {
 	socketPath string
-	listener   net.Listener
+
+	lnMu      sync.Mutex
+	listener  net.Listener
+	socketIno uint64
+	closing   bool
 
 	mu       sync.Mutex
 	sessions map[string]*Session // name → session
@@ -64,6 +72,14 @@ func (s *Server) Start() error {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
+	return s.Serve(l)
+}
+
+// Serve accepts client connections on an already-created listener. This is used
+// by hot restore after exec, where the listening socket fd is inherited.
+func (s *Server) Serve(l net.Listener) error {
+	s.setListener(l)
+	s.recordSocketInode()
 	log.Printf("aetherd listening on %s", s.socketPath)
 
 	// Handle shutdown signals gracefully
@@ -76,10 +92,31 @@ func (s *Server) Start() error {
 		os.Exit(0)
 	}()
 
+	// Guard the socket file. /run/user is a volatile tmpfs: if the socket file is
+	// unlinked while the daemon runs, the kernel keeps the listener open but every
+	// client connect() fails with ENOENT forever. The guard recreates it.
+	go s.guardSocket()
+
+	return s.acceptLoop()
+}
+
+// acceptLoop accepts connections off the current listener. If the socket guard
+// swaps in a replacement listener (after the socket file vanished), it closes
+// the old one; we notice the swap and keep serving on the new listener.
+func (s *Server) acceptLoop() error {
 	for {
+		l := s.currentListener()
 		conn, err := l.Accept()
 		if err != nil {
-			// Listener closed — shutting down
+			if s.isClosing() {
+				return nil
+			}
+			// A guard re-listen closes the old listener to swap in a new one.
+			// If the current listener changed, adopt it and keep serving;
+			// otherwise this is a genuine fatal error.
+			if s.currentListener() != l {
+				continue
+			}
 			return nil
 		}
 		go s.handleConn(conn)
@@ -87,7 +124,13 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) shutdown() {
-	s.listener.Close()
+	s.lnMu.Lock()
+	s.closing = true
+	l := s.listener
+	s.lnMu.Unlock()
+	if l != nil {
+		l.Close()
+	}
 	os.Remove(s.socketPath)
 
 	s.mu.Lock()
@@ -95,6 +138,121 @@ func (s *Server) shutdown() {
 	for _, sess := range s.sessions {
 		sess.Kill()
 	}
+}
+
+// --- socket guard ---
+
+func (s *Server) setListener(l net.Listener) {
+	s.lnMu.Lock()
+	s.listener = l
+	s.lnMu.Unlock()
+}
+
+func (s *Server) currentListener() net.Listener {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	return s.listener
+}
+
+func (s *Server) isClosing() bool {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	return s.closing
+}
+
+// recordSocketInode remembers the inode of the socket file currently backing the
+// listener, so the guard can tell "our socket is gone" from "another instance
+// rebound the path".
+func (s *Server) recordSocketInode() {
+	_, ino := socketPresent(s.socketPath)
+	s.lnMu.Lock()
+	s.socketIno = ino
+	s.lnMu.Unlock()
+}
+
+func (s *Server) expectedInode() uint64 {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	return s.socketIno
+}
+
+// guardSocket periodically verifies the listening socket file still exists and
+// still refers to this daemon's listener, recreating it if it was unlinked.
+// Live sessions are unaffected — only the listener used for new connections is
+// replaced.
+func (s *Server) guardSocket() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if s.isClosing() {
+			return
+		}
+		present, ino := socketPresent(s.socketPath)
+		switch {
+		case present && ino == s.expectedInode():
+			// healthy
+		case present:
+			// Another instance rebound the path; don't fight over it.
+			log.Printf("aetherd: socket %s replaced by another instance; stopping socket guard", s.socketPath)
+			return
+		default:
+			log.Printf("aetherd: socket %s vanished; recreating", s.socketPath)
+			if err := s.relisten(); err != nil {
+				log.Printf("aetherd: recreate socket failed: %v", err)
+			}
+		}
+	}
+}
+
+// relisten creates a fresh listener on the socket path and swaps it in for the
+// stale one. Already-accepted connections (attached clients) keep working; only
+// new connections use the replacement.
+func (s *Server) relisten() error {
+	dir := filepath.Dir(s.socketPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	os.Remove(s.socketPath)
+
+	l, err := net.Listen("unix", s.socketPath)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	if err := os.Chmod(s.socketPath, 0600); err != nil {
+		l.Close()
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+
+	s.lnMu.Lock()
+	old := s.listener
+	s.listener = l
+	s.lnMu.Unlock()
+	s.recordSocketInode()
+
+	if old != nil {
+		// The old listener is bound to the now-unlinked inode. Its default Close
+		// would unlink the path — which now points at the socket we just created
+		// — so disable that before closing. Closing unblocks acceptLoop, which
+		// then adopts the new listener.
+		if ul, ok := old.(*net.UnixListener); ok {
+			ul.SetUnlinkOnClose(false)
+		}
+		old.Close()
+	}
+	log.Printf("aetherd: re-listening on %s", s.socketPath)
+	return nil
+}
+
+// socketPresent reports whether the socket path exists and, if so, its inode.
+func socketPresent(path string) (bool, uint64) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false, 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return true, st.Ino
+	}
+	return true, 0
 }
 
 // handleConn reads a newline-delimited JSON request from the client and routes
@@ -145,6 +303,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	case "restart_all":
 		s.handleRestartAll(conn)
 
+	case "upgrade":
+		s.handleUpgrade(conn)
+
 	case "detach":
 		// Client is explicitly detaching; the stream is closed via a detach
 		// frame on the attach connection, so nothing to do here.
@@ -161,12 +322,19 @@ func (s *Server) handleList(conn net.Conn) {
 	s.pruneDeadSessions()
 
 	s.mu.Lock()
+	hostname, _ := os.Hostname()
 	managedTTYs := make(map[string]bool, len(s.order))
 	sessions := make([]proto.Session, 0, len(s.order))
-	for _, name := range s.order {
+	for _, name := range append([]string(nil), s.order...) {
 		sess := s.sessions[name]
+		if sess == nil {
+			continue
+		}
 		fgPid := sess.ForegroundPID()
 		agent := detect.Detect(fgPid)
+		if title := sessiontitle.FromInfo(agent, hostname); title != "" {
+			s.renameSessionLocked(sess, title)
+		}
 		attached, lastAttached := sess.AttachmentState()
 		if pts := sess.PtsName(); pts != "" {
 			managedTTYs[pts] = true
@@ -365,6 +533,118 @@ func (s *Server) handleRestartAll(conn net.Conn) {
 	json.NewEncoder(conn).Encode(proto.Response{Type: "ok"})
 }
 
+// handleUpgrade replaces the running daemon process with the current aetherd
+// binary while preserving the listener and all PTY master fds. Existing attach
+// streams disconnect, but the shells remain alive and reconnect to the new
+// daemon instance.
+func (s *Server) handleUpgrade(conn net.Conn) {
+	statePath, listenerFile, err := s.prepareUpgrade()
+	if err != nil {
+		s.sendError(conn, "prepare upgrade: "+err.Error())
+		return
+	}
+	defer listenerFile.Close()
+
+	exe, err := os.Executable()
+	if err != nil {
+		s.sendError(conn, "upgrade executable: "+err.Error())
+		return
+	}
+	if _, err := exec.LookPath(exe); err != nil {
+		s.sendError(conn, "upgrade executable: "+err.Error())
+		return
+	}
+
+	if err := json.NewEncoder(conn).Encode(proto.Response{Type: "ok"}); err != nil {
+		return
+	}
+	_ = conn.Close()
+
+	argv := []string{exe, "--restore", statePath}
+	env := append(os.Environ(), restoreFDEnv+"="+strconv.Itoa(int(listenerFile.Fd())))
+	log.Printf("hot-upgrading daemon via exec: %s", exe)
+	if err := syscall.Exec(exe, argv, env); err != nil {
+		log.Printf("hot upgrade failed: %v", err)
+	}
+}
+
+func (s *Server) prepareUpgrade() (string, *os.File, error) {
+	fileProvider, ok := s.currentListener().(interface {
+		File() (*os.File, error)
+	})
+	if !ok {
+		return "", nil, fmt.Errorf("listener does not expose a file descriptor")
+	}
+	listenerFile, err := fileProvider.File()
+	if err != nil {
+		return "", nil, fmt.Errorf("listener fd: %w", err)
+	}
+	if err := clearCloseOnExec(int(listenerFile.Fd())); err != nil {
+		listenerFile.Close()
+		return "", nil, err
+	}
+
+	state := restoreState{
+		SocketPath: s.socketPath,
+		Affinity:   map[string]string{},
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for k, v := range s.affinity {
+		state.Affinity[k] = v
+	}
+	state.Order = append([]string(nil), s.order...)
+
+	for _, name := range s.order {
+		sess := s.sessions[name]
+		if sess == nil || !sess.IsAlive() {
+			continue
+		}
+		if err := clearCloseOnExec(int(sess.pty.Fd())); err != nil {
+			listenerFile.Close()
+			return "", nil, fmt.Errorf("session %s pty fd: %w", name, err)
+		}
+		sess.mu.Lock()
+		geo := sess.geo
+		lastAttached := sess.LastAttached
+		sess.mu.Unlock()
+		state.Sessions = append(state.Sessions, restoreSession{
+			Name:        sess.Name,
+			CreatedUnix: sess.Created.UnixNano(),
+			ClientID:    sess.ClientID,
+			LastUnix:    lastAttached.UnixNano(),
+			ShellPID:    sess.shellPid,
+			Geometry:    geo,
+			PTYFD:       int(sess.pty.Fd()),
+		})
+	}
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		listenerFile.Close()
+		return "", nil, err
+	}
+	statePath := filepath.Join(filepath.Dir(s.socketPath), fmt.Sprintf("restore-%d.json", os.Getpid()))
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		listenerFile.Close()
+		return "", nil, err
+	}
+	return statePath, listenerFile, nil
+}
+
+func clearCloseOnExec(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		return fmt.Errorf("fcntl getfd: %w", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags&^unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("fcntl setfd: %w", err)
+	}
+	return nil
+}
+
 // streamSession is the data path. It sends the "attached" handshake, then:
 //   - replays the session's scrollback so a (re)attaching client sees the
 //     history that was last on screen, then streams live PTY output to the
@@ -376,6 +656,7 @@ func (s *Server) handleRestartAll(conn net.Conn) {
 func (s *Server) streamSession(conn net.Conn, br *bufio.Reader, sess *Session, att *attachment) {
 	defer sess.ReleaseAttachment(att)
 
+	s.refreshSessionTitle(sess)
 	_, lastAttached := sess.AttachmentState()
 	resp := proto.Response{
 		Type:    "attached",
@@ -422,6 +703,27 @@ func (s *Server) streamSession(conn net.Conn, br *bufio.Reader, sess *Session, a
 			return
 		}
 	}
+
+	lastTitle := ""
+	writeTitle := func(force bool) bool {
+		title := s.refreshSessionTitle(sess)
+		if title == "" || (!force && title == lastTitle) {
+			return true
+		}
+		lastTitle = title
+		osc := sessiontitle.OSC(title)
+		if len(osc) == 0 {
+			return true
+		}
+		return proto.WriteFrame(conn, proto.FrameData, osc) == nil
+	}
+	if !writeTitle(true) {
+		return
+	}
+
+	titleTick := time.NewTicker(2 * time.Second)
+	defer titleTick.Stop()
+
 	for {
 		select {
 		case b, ok := <-sub.data:
@@ -435,6 +737,10 @@ func (s *Server) streamSession(conn net.Conn, br *bufio.Reader, sess *Session, a
 			return
 		case <-att.takeover:
 			return
+		case <-titleTick.C:
+			if !writeTitle(false) {
+				return
+			}
 		}
 	}
 }
@@ -484,6 +790,59 @@ func (s *Server) removeAffinityLocked(sessionName string) {
 		if name == sessionName {
 			delete(s.affinity, clientID)
 		}
+	}
+}
+
+func (s *Server) refreshSessionTitle(sess *Session) string {
+	agent := detect.Detect(sess.ForegroundPID())
+	hostname, _ := os.Hostname()
+	title := sessiontitle.FromInfo(agent, hostname)
+	if title == "" {
+		return ""
+	}
+	s.mu.Lock()
+	s.renameSessionLocked(sess, title)
+	s.mu.Unlock()
+	return title
+}
+
+func (s *Server) renameSessionLocked(sess *Session, desired string) {
+	desired = strings.TrimSpace(desired)
+	if desired == "" || sess == nil || sess.Name == desired {
+		return
+	}
+
+	old := sess.Name
+	name := s.uniqueRenamedSessionNameLocked(desired, sess)
+	if old == name {
+		return
+	}
+
+	delete(s.sessions, old)
+	s.sessions[name] = sess
+	sess.Name = name
+
+	for i, n := range s.order {
+		if n == old {
+			s.order[i] = name
+			break
+		}
+	}
+	for clientID, mapped := range s.affinity {
+		if mapped == old {
+			s.affinity[clientID] = name
+		}
+	}
+}
+
+func (s *Server) uniqueRenamedSessionNameLocked(base string, sess *Session) string {
+	name := base
+	for i := 2; ; i++ {
+		existing := s.sessions[name]
+		if existing == nil || existing == sess {
+			return name
+		}
+		name = fmt.Sprintf("%s-%d", base, i)
 	}
 }
 

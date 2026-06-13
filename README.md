@@ -60,6 +60,11 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   editors, CLIs, etc.) by scanning the process tree — works for
   both managed and external sessions, even when the agent is a grandchild of the
   login shell (`login → bash → agent`).
+- **Dynamic tab and session names** — attached terminals that support OSC title
+  sequences (including GNOME Terminal/Terminator) are titled by what matters:
+  coding agents use `Project/.agent` such as `Aethershell/.codex`, while idle
+  shells use `Host:/.shell` such as `Cosmo:/.bash`. Managed session names follow
+  the same format.
 - **Terminal geometry capture** — captures the SSH client's terminal size (and
   pixel dimensions/orientation when reported), caches it, applies it to the PTY,
   and exports `AETHER_GEOMETRY`/`COLUMNS`/`LINES` into the shell so an onward
@@ -207,13 +212,24 @@ aether --takeover shell-20260612-120000  # force-attach a stale busy session
 
 ```bash
 systemctl --user start aetherd.service
-systemctl --user restart aetherd.service
+systemctl --user reload aetherd.service      # hot-upgrade without killing sessions
+systemctl --user restart aetherd.service     # hard restart; kills existing PTY sessions
 systemctl --user status aetherd.service
 journalctl --user -u aetherd.service
 ```
 
 The `aether` login shell wrapper will start this service automatically when it
 needs a daemon and no socket exists.
+
+After installing a new `aetherd` binary, prefer:
+
+```bash
+aether --upgrade-daemon
+```
+
+That execs the new daemon in place and hands off the existing listener and PTY
+master file descriptors, so managed shells survive. Existing attached clients
+disconnect during the exec and then reconnect to the same sessions.
 
 ## Emergency bypass
 

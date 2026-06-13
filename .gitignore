@@ -1,7 +1,5 @@
 # Build artifacts
-bin/aether
-bin/aether-connect
-bin/aetherd
+bin/
 *.exe
 
 # Go
