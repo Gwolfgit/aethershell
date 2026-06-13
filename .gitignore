@@ -1,0 +1,18 @@
+# Build artifacts
+bin/aether
+bin/aether-connect
+bin/aetherd
+*.exe
+
+# Go
+vendor/
+
+# Local state / logs produced at runtime (never committed)
+*.log
+state/
+var/
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
