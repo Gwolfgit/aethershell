@@ -6,6 +6,31 @@ import (
 	"strings"
 )
 
+// procStartTicks returns field 22 (starttime, in clock ticks since boot) of
+// /proc/<pid>/stat. Combined with the PID it uniquely identifies a process
+// instance: the kernel never reuses a (pid, starttime) pair, so comparing it
+// detects PID reuse after the original process exits. Returns (0,false) if it
+// can't be read.
+func procStartTicks(pid int) (uint64, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	fields := splitStat(string(data))
+	// 1-indexed field 22 == 0-indexed 21.
+	if len(fields) < 22 {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(fields[21]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
 // foregroundPID reads /proc/<pid>/stat to find the foreground process group
 // and then finds the process in that group with the given shell PID as ancestor.
 // Returns the foreground PID, or 0 if it can't be determined.

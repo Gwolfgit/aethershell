@@ -141,11 +141,60 @@ func (c *Client) sendSimple(reqType, name string) error {
 	return nil
 }
 
-// doAttach connects to the daemon, sends a create/attach request, then runs the
+// SwitchInPlace asks the daemon to move the client currently viewing the session
+// on fromTTY to a different session — `target`, or a freshly created one when
+// newSession is true. This is what an in-session `aether --menu/--attach/--new`
+// uses so navigation reuses the existing terminal instead of nesting a second
+// client. The caller (an in-session helper process) exits afterwards; the actual
+// reattach happens in the login client that owns the terminal.
+func (c *Client) SwitchInPlace(fromTTY, target string, force, newSession bool, geo Geometry) error {
+	conn, err := net.Dial("unix", c.socketPath)
+	if err != nil {
+		return fmt.Errorf("connect to daemon: %w", err)
+	}
+	defer conn.Close()
+
+	req := proto.Request{
+		Type: "switch", FromTTY: fromTTY, Target: target, Force: force, New: newSession,
+		Rows: geo.Rows, Cols: geo.Cols, XPixel: geo.XPixel, YPixel: geo.YPixel,
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	var resp proto.Response
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.Type == "error" {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
+// doAttach attaches and then keeps the terminal on whatever session the daemon
+// points it at: if a stream ends with a switch-in-place directive (an in-session
+// `aether --menu/--attach/--new`), it attaches the new target in the same
+// terminal instead of returning, so navigation never nests a second client.
+func (c *Client) doAttach(req proto.Request) error {
+	for {
+		next, err := c.streamOnce(req)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		req = proto.Request{Type: "attach", Name: next.Name, Force: next.Force, ClientID: req.ClientID}
+	}
+}
+
+// streamOnce connects to the daemon, sends a create/attach request, then runs the
 // framed data stream: the daemon replays scrollback and streams live PTY output
 // as data frames, while keystrokes/resize/detach travel back as frames. The
 // daemon stays in the data path (no fd passing) so it can buffer scrollback.
-func (c *Client) doAttach(req proto.Request) error {
+// It returns a non-nil SwitchTarget when the daemon asked the client to switch
+// to another session in place.
+func (c *Client) streamOnce(req proto.Request) (*proto.SwitchTarget, error) {
 	geo := CurrentGeometry()
 	req.Rows = geo.Rows
 	req.Cols = geo.Cols
@@ -154,14 +203,14 @@ func (c *Client) doAttach(req proto.Request) error {
 
 	conn, err := net.Dial("unix", c.socketPath)
 	if err != nil {
-		return fmt.Errorf("connect to daemon: %w", err)
+		return nil, fmt.Errorf("connect to daemon: %w", err)
 	}
 	defer conn.Close()
 
 	// Send request (json.Encoder appends a newline the daemon reads as the
 	// request line delimiter).
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return nil, fmt.Errorf("send request: %w", err)
 	}
 
 	// Read the newline-delimited handshake response, leaving subsequent frame
@@ -169,20 +218,20 @@ func (c *Client) doAttach(req proto.Request) error {
 	br := bufio.NewReader(conn)
 	line, err := br.ReadBytes('\n')
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 	var resp proto.Response
 	if err := json.Unmarshal(line, &resp); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	if resp.Type == "error" {
-		return fmt.Errorf("%s", resp.Error)
+		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
 	// ---- Terminal raw mode ----
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		return fmt.Errorf("terminal raw mode: %w", err)
+		return nil, fmt.Errorf("terminal raw mode: %w", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
@@ -236,10 +285,12 @@ func (c *Client) doAttach(req proto.Request) error {
 		conn.Close()
 	}()
 
-	// Main loop: data frames → stdout.
+	// Main loop: data frames → stdout, until the stream ends or the daemon
+	// directs a switch-in-place.
 	started := time.Now()
 	var written int64
 	var copyErr error
+	var switchTo *proto.SwitchTarget
 	for {
 		typ, payload, ferr := proto.ReadFrame(br)
 		if ferr != nil {
@@ -254,14 +305,25 @@ func (c *Client) doAttach(req proto.Request) error {
 				break
 			}
 			written += int64(len(payload))
+			continue
+		}
+		if typ == proto.FrameSwitch {
+			var st proto.SwitchTarget
+			if json.Unmarshal(payload, &st) == nil && st.Name != "" {
+				switchTo = &st
+				break
+			}
 		}
 	}
 
 	if copyErr != nil {
-		return fmt.Errorf("session I/O: %w", copyErr)
+		return nil, fmt.Errorf("session I/O: %w", copyErr)
+	}
+	if switchTo != nil {
+		return switchTo, nil
 	}
 	if written == 0 && time.Since(started) < time.Second {
-		return fmt.Errorf("session ended immediately")
+		return nil, fmt.Errorf("session ended immediately")
 	}
-	return nil
+	return nil, nil
 }

@@ -69,8 +69,10 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   pixel dimensions/orientation when reported), caches it, applies it to the PTY,
   and exports `AETHER_GEOMETRY`/`COLUMNS`/`LINES` into the shell so an onward
   `ssh` hop to another aether box inherits the right size.
-- **Per-user isolation** — each user gets a private daemon instance via Unix
-  socket; sessions never leak between users.
+- **Per-user isolation** — each user gets a private daemon instance via a Unix
+  socket. Isolation is enforced in depth: a `0700` runtime dir, a `0600` socket,
+  **and** an `SO_PEERCRED` peer-uid check in the daemon, so sessions stay private
+  even if the file permissions are ever loosened. See [SECURITY.md](SECURITY.md).
 - **Doesn't break tooling** — `scp`, `rsync`, `sftp`, and `ssh host <cmd>` all
   bypass the wrapper and run a normal shell. No nesting when already inside
   tmux/screen.
@@ -148,6 +150,13 @@ two-line status bar at the bottom shows the keys:
 External rows ignore attach/kill/restart (a notice explains why). The chooser
 uses raw ANSI control sequences — no `tput`/terminfo dependency.
 
+**Switch in place.** When you run `aether --menu`, `aether --attach <name>`, or
+`aether --new` *from inside an existing session*, aether moves your current
+terminal to the chosen session — like `tmux switch-client` — instead of nesting
+a second viewer inside the first. This avoids leaving a hidden client attached to
+a session you've navigated away from (which would otherwise keep that session
+pinned "in use").
+
 ## Layout
 
 ```
@@ -165,7 +174,7 @@ internal/detect/         # agent detection via process tree inspection
 ## Requirements
 
 - Linux with `/proc` filesystem and `/var/run/utmp`
-- Go 1.19+ (to build from source)
+- Go 1.21+ (to build from source)
 - Remote-only activation is wired by `/etc/profile.d/aether.sh` (installed by
   `install.sh`) — no `chsh` needed
 
@@ -249,6 +258,24 @@ Remove the file to re-enable aethershell. You can also set
 ```bash
 sudo ./install.sh --uninstall
 ```
+
+## Security
+
+AetherShell holds your live terminal, so its trust model matters. In short:
+
+- The daemon is **per-user** and authenticates connections by uid
+  (`SO_PEERCRED`) on top of `0700`/`0600` permissions — another local user
+  cannot reach your sessions.
+- Session metadata shown by `aether --list`/the chooser is sanitized of terminal
+  control bytes, so a booby-trapped file/directory name can't inject escape
+  sequences into your terminal.
+- The `install.sh` login hook is **box-wide**: it routes every user's remote
+  interactive SSH login through `aether`. Know the recovery paths
+  (`~/.aethershell/disabled`, `AETHER_DISABLE=1`, `ssh host bash -l`, or removing
+  `/etc/profile.d/aether.sh`) before enabling it on a shared host.
+
+Read the full threat model, deployment guidance, and known limitations in
+**[SECURITY.md](SECURITY.md)**.
 
 ## License
 

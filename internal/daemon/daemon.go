@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,10 +24,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// handshakeTimeout bounds how long a connection may take to send its initial
+// JSON request line. Without it, a client that connects and never sends a
+// newline parks a handler goroutine (and an fd) indefinitely; many such
+// connections exhaust the daemon. The deadline is cleared once a stream is
+// established, since attach connections are intentionally long-lived.
+// It is a var only so tests can shorten it.
+var handshakeTimeout = 15 * time.Second
+
+// maxConcurrentConns bounds in-flight connection handlers so a flood of
+// half-open connections cannot exhaust goroutines/fds. Legitimate use (a
+// handful of attached terminals plus the occasional list/management call) is
+// far below this.
+const maxConcurrentConns = 256
+
 // Server is the aether daemon: manages PTY sessions and serves client
 // connections over a Unix domain socket.
 type Server struct {
 	socketPath string
+
+	connCount int32 // atomic: in-flight handleConn count
 
 	lnMu      sync.Mutex
 	listener  net.Listener
@@ -51,10 +68,16 @@ func NewServer(socketPath string) *Server {
 // Start begins listening and accepting connections. Blocks until the server
 // shuts down (via SIGTERM/SIGINT, or when the socket is removed).
 func (s *Server) Start() error {
-	// Ensure socket directory exists
+	// Ensure socket directory exists and is private. MkdirAll only applies the
+	// mode to directories it creates, so chmod an existing dir too: the 0700
+	// parent is what protects the socket during the unavoidable window between
+	// net.Listen creating it and the Chmod below tightening it to 0600.
 	dir := filepath.Dir(s.socketPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("chmod dir %s: %w", dir, err)
 	}
 
 	// Remove stale socket
@@ -212,6 +235,9 @@ func (s *Server) relisten() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("chmod dir %s: %w", dir, err)
+	}
 	os.Remove(s.socketPath)
 
 	l, err := net.Listen("unix", s.socketPath)
@@ -262,7 +288,25 @@ func socketPresent(path string) (bool, uint64) {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Bound concurrent handlers so a half-open flood cannot exhaust the daemon.
+	n := atomic.AddInt32(&s.connCount, 1)
+	defer atomic.AddInt32(&s.connCount, -1)
+	if n > maxConcurrentConns {
+		log.Printf("aetherd: too many concurrent connections (%d); dropping", n)
+		return
+	}
+
+	// Defense in depth: only this user's processes may talk to the daemon, even
+	// if the socket/runtime-dir permissions are ever loosened.
+	if !s.authorizePeer(conn) {
+		return
+	}
+
 	br := bufio.NewReader(conn)
+
+	// Bound the handshake: a connection that never sends a request line must not
+	// pin a goroutine/fd forever.
+	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	// The client encodes its request with json.Encoder, which appends a newline.
 	// Read exactly that line so all subsequent bytes remain buffered for frames.
@@ -271,6 +315,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.sendError(conn, "bad request: "+err.Error())
 		return
 	}
+
+	// Request line received; clear the deadline so attach streams (which are
+	// long-lived and idle between keystrokes) are not torn down.
+	_ = conn.SetReadDeadline(time.Time{})
 	var req proto.Request
 	if err := json.Unmarshal(line, &req); err != nil {
 		s.sendError(conn, "bad request: "+err.Error())
@@ -290,6 +338,9 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	case "attach_client":
 		s.handleAttachClient(conn, br, req.ClientID, geoFromReq(req))
+
+	case "switch":
+		s.handleSwitch(conn, req)
 
 	case "kill":
 		s.handleKill(conn, req.Name)
@@ -464,6 +515,77 @@ func (s *Server) handleAttachClient(conn net.Conn, br *bufio.Reader, clientID st
 	s.streamSession(conn, br, sess, att)
 }
 
+// handleSwitch implements tmux-like switch-client. An in-session command running
+// on tty req.FromTTY asks whichever client is currently viewing that session to
+// attach a different session in place (req.Target), or a freshly created one
+// (req.New), instead of nesting a second client inside the first. The current
+// session is found by its controlling tty, so it survives session renames.
+func (s *Server) handleSwitch(conn net.Conn, req proto.Request) {
+	if req.FromTTY == "" {
+		s.sendError(conn, "switch: missing source tty")
+		return
+	}
+
+	s.mu.Lock()
+	cur := s.findByTTYLocked(req.FromTTY)
+	if cur == nil {
+		s.mu.Unlock()
+		s.sendError(conn, "switch: no managed session on "+req.FromTTY)
+		return
+	}
+
+	var (
+		targetName string
+		created    *Session
+	)
+	if req.New {
+		name := s.uniqueSessionNameLocked()
+		sess, err := NewSession(name, geoFromReq(req), "")
+		if err != nil {
+			s.mu.Unlock()
+			s.sendError(conn, "switch: create session: "+err.Error())
+			return
+		}
+		s.sessions[name] = sess
+		s.order = append(s.order, name)
+		targetName, created = name, sess
+	} else {
+		if req.Target == "" || s.sessions[req.Target] == nil {
+			s.mu.Unlock()
+			s.sendError(conn, "switch: target session not found: "+req.Target)
+			return
+		}
+		targetName = req.Target
+	}
+	s.mu.Unlock()
+
+	if !cur.RequestSwitch(proto.SwitchTarget{Name: targetName, Force: req.Force}) {
+		// No live client to redirect; don't leave a freshly created session orphaned.
+		if created != nil {
+			s.mu.Lock()
+			created.Kill()
+			delete(s.sessions, targetName)
+			s.order = removeStr(s.order, targetName)
+			s.mu.Unlock()
+		}
+		s.sendError(conn, "switch: current session has no attached client")
+		return
+	}
+	json.NewEncoder(conn).Encode(proto.Response{Type: "ok"})
+}
+
+// findByTTYLocked returns the managed session whose PTY slave is the given tty
+// (e.g. "pts/7"), or nil. Caller must hold s.mu.
+func (s *Server) findByTTYLocked(tty string) *Session {
+	for _, name := range s.order {
+		sess := s.sessions[name]
+		if sess != nil && sess.PtsName() == tty {
+			return sess
+		}
+	}
+	return nil
+}
+
 // handleKill destroys a session.
 func (s *Server) handleKill(conn net.Conn, name string) {
 	s.mu.Lock()
@@ -544,6 +666,11 @@ func (s *Server) handleUpgrade(conn net.Conn) {
 		return
 	}
 	defer listenerFile.Close()
+	// On a successful exec this process is replaced and the new daemon removes
+	// the state file after reading it. These deferred cleanups only run if the
+	// upgrade fails, so a failed upgrade does not leave session metadata
+	// (names, client IDs) lingering on disk.
+	defer os.Remove(statePath)
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -616,6 +743,7 @@ func (s *Server) prepareUpgrade() (string, *os.File, error) {
 			ClientID:    sess.ClientID,
 			LastUnix:    lastAttached.UnixNano(),
 			ShellPID:    sess.shellPid,
+			ShellStart:  sess.shellStart,
 			Geometry:    geo,
 			PTYFD:       int(sess.pty.Fd()),
 		})
@@ -737,6 +865,13 @@ func (s *Server) streamSession(conn net.Conn, br *bufio.Reader, sess *Session, a
 			return
 		case <-att.takeover:
 			return
+		case target := <-att.switchTo:
+			// In-session switch-client: tell the client to attach `target` in
+			// place of this session, then end the stream.
+			if b, err := json.Marshal(target); err == nil {
+				_ = proto.WriteFrame(conn, proto.FrameSwitch, b)
+			}
+			return
 		case <-titleTick.C:
 			if !writeTitle(false) {
 				return
@@ -807,7 +942,10 @@ func (s *Server) refreshSessionTitle(sess *Session) string {
 }
 
 func (s *Server) renameSessionLocked(sess *Session, desired string) {
-	desired = strings.TrimSpace(desired)
+	// Strip any control bytes before the title becomes the session name: the
+	// name is sent to clients and rendered to terminals, and titles are derived
+	// from untrusted cwd/cmdline data.
+	desired = strings.TrimSpace(proto.SanitizeTerminal(desired))
 	if desired == "" || sess == nil || sess.Name == desired {
 		return
 	}

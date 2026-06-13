@@ -193,6 +193,7 @@ func renderMenu(sessions []proto.Session, selected int, message string) {
 	fmt.Print("\x1b[H\x1b[2J")
 
 	host, _ := os.Hostname()
+	host = proto.SanitizeTerminal(host)
 	managed := managedCount(sessions)
 	external := len(sessions) - managed
 
@@ -201,7 +202,7 @@ func renderMenu(sessions []proto.Session, selected int, message string) {
 		cCyan, cReset, cDim, host, cReset)
 
 	if message != "" {
-		fmt.Printf("  %s%s%s\r\n\r\n", cYellow, padOrTrunc(message, cols-4), cReset)
+		fmt.Printf("  %s%s%s\r\n\r\n", cYellow, padOrTrunc(proto.SanitizeTerminal(message), cols-4), cReset)
 	}
 
 	// Column header.
@@ -241,8 +242,10 @@ func renderMenu(sessions []proto.Session, selected int, message string) {
 			}
 			running := agentTitle(s)
 			line := rowLine(arrow, strconv.Itoa(i+1)+" "+marker,
-				trunc(s.Name, 22), stext, trunc(running, 26),
-				trunc(s.Agent.WorkDir, 18), sessionAge(s.Created), s.RemoteHost)
+				trunc(proto.SanitizeTerminal(s.Name), 22), stext,
+				trunc(proto.SanitizeTerminal(running), 26),
+				trunc(proto.SanitizeTerminal(s.Agent.WorkDir), 18), sessionAge(s.Created),
+				proto.SanitizeTerminal(s.RemoteHost))
 			line = runePadTrunc(line, cols)
 
 			if i == selected {
@@ -345,7 +348,8 @@ func showBar(msg string) {
 	if cols < 20 {
 		cols = 80
 	}
-	fmt.Printf("\x1b[%d;1H\x1b[7m%s\x1b[0m", rows, padOrTrunc(msg, cols))
+	// msg embeds untrusted session names / remote hosts; strip control bytes.
+	fmt.Printf("\x1b[%d;1H\x1b[7m%s\x1b[0m", rows, padOrTrunc(proto.SanitizeTerminal(msg), cols))
 }
 
 func confirmBar(msg string) bool {
