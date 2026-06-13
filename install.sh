@@ -125,6 +125,18 @@ Activation is REMOTE-ONLY: the $PROFILE_HOOK snippet hands off SSH logins to
 aether, while local console/serial logins fall through to a plain shell
 untouched. No chsh required (and chsh would also catch local console).
 
+⚠  SECURITY NOTE — this is a BOX-WIDE change:
+  • $PROFILE_HOOK routes EVERY user's remote interactive SSH login through
+    aether, and the service is enabled for all users (systemctl --global).
+  • If aether/aetherd ever misbehave, interactive SSH logins could be affected.
+  • Recovery (any one):
+      ssh host bash -l            # non-interactive bypass
+      touch ~/.aethershell/disabled   # per-user opt-out
+      AETHER_DISABLE=1            # per-session opt-out
+      rm $PROFILE_HOOK   # remove the hook
+  • On a shared/multi-user host, review SECURITY.md and consider enabling the
+    hook selectively instead of globally.
+
 To carry terminal geometry across an ssh hop to another aether box, allow the
 env var through on BOTH ends:
   client ~/.ssh/config :   SendEnv AETHER_GEOMETRY

@@ -53,16 +53,26 @@ same-uid code execution are scored as safety/robustness, not privilege crossing.
 
 ## Findings
 
-| ID | Severity | Title |
-|----|----------|-------|
-| F1 | High     | Per-user isolation relies on a single `chmod`; no peer-credential check |
-| F2 | Medium   | Terminal escape-sequence injection via unsanitized session metadata |
-| F3 | Medium   | PID-reuse: daemon SIGKILLs an arbitrary same-user PID after hot-upgrade |
-| F4 | Medium   | No handshake read deadline / unbounded connections / pre-allocated frames |
-| F5 | Medium   | `client_id` is an unauthenticated bearer capability that is broadly exposed |
-| F6 | Low      | Aggressive global install defaults (intercepts all users' SSH logins) |
-| F7 | Low      | Stale `restore-*.json` left on a failed hot-upgrade leaks session metadata |
-| F8 | Low      | Outdated `go` directive (1.19, EOL) and pinned x/sys, x/term |
+| ID | Severity | Title | Status |
+|----|----------|-------|--------|
+| F1 | High     | Per-user isolation relies on a single `chmod`; no peer-credential check | Fixed (SO_PEERCRED + dir chmod), verified live |
+| F2 | Medium   | Terminal escape-sequence injection via unsanitized session metadata | Fixed (SanitizeTerminal), verified live |
+| F3 | Medium   | PID-reuse: daemon SIGKILLs an arbitrary same-user PID after hot-upgrade | Fixed (start-time guard), tested |
+| F4 | Medium   | No handshake read deadline / unbounded connections / pre-allocated frames | Fixed (deadline + conn cap), tested |
+| F5 | Medium   | `client_id` is an unauthenticated bearer capability that is broadly exposed | Mitigated by F1; documented in SECURITY.md |
+| F6 | Low      | Aggressive global install defaults (intercepts all users' SSH logins) | Documented (install.sh warning + SECURITY.md) |
+| F7 | Low      | Stale `restore-*.json` left on a failed hot-upgrade leaks session metadata | Fixed (cleanup on exec failure) |
+| F8 | Low      | Outdated `go` directive (1.19, EOL) and pinned x/sys, x/term | `go` bumped to 1.21; dep bump left to maintainer (latest forces go 1.25) |
+
+**Post-fix live verification (Docker harness, rebuilt with the patched code):**
+- F1: with the socket forced to `0666` in a traversable dir, the attacker's
+  `connect()` now succeeds but the daemon logs `rejecting connection from uid
+  2001 (daemon runs as uid 2000)` and serves nothing; the legitimate uid still
+  works.
+- F2: `aether --list` of a session sitting in a directory with an escape-laden
+  name now emits **no ESC bytes** — the OSC/CSI sequences render as inert text.
+- F3: a hot-upgrade still preserves live sessions (start-time matches), and the
+  Go regression test confirms a recycled PID is neither adopted nor killed.
 
 ---
 
