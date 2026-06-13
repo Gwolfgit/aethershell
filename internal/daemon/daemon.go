@@ -51,10 +51,16 @@ func NewServer(socketPath string) *Server {
 // Start begins listening and accepting connections. Blocks until the server
 // shuts down (via SIGTERM/SIGINT, or when the socket is removed).
 func (s *Server) Start() error {
-	// Ensure socket directory exists
+	// Ensure socket directory exists and is private. MkdirAll only applies the
+	// mode to directories it creates, so chmod an existing dir too: the 0700
+	// parent is what protects the socket during the unavoidable window between
+	// net.Listen creating it and the Chmod below tightening it to 0600.
 	dir := filepath.Dir(s.socketPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("chmod dir %s: %w", dir, err)
 	}
 
 	// Remove stale socket
@@ -212,6 +218,9 @@ func (s *Server) relisten() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("chmod dir %s: %w", dir, err)
+	}
 	os.Remove(s.socketPath)
 
 	l, err := net.Listen("unix", s.socketPath)
@@ -261,6 +270,12 @@ func socketPresent(path string) (bool, uint64) {
 // pipelines after the request line stay available to the frame parser.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	// Defense in depth: only this user's processes may talk to the daemon, even
+	// if the socket/runtime-dir permissions are ever loosened.
+	if !s.authorizePeer(conn) {
+		return
+	}
 
 	br := bufio.NewReader(conn)
 
@@ -807,7 +822,10 @@ func (s *Server) refreshSessionTitle(sess *Session) string {
 }
 
 func (s *Server) renameSessionLocked(sess *Session, desired string) {
-	desired = strings.TrimSpace(desired)
+	// Strip any control bytes before the title becomes the session name: the
+	// name is sent to clients and rendered to terminals, and titles are derived
+	// from untrusted cwd/cmdline data.
+	desired = strings.TrimSpace(proto.SanitizeTerminal(desired))
 	if desired == "" || sess == nil || sess.Name == desired {
 		return
 	}

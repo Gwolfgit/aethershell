@@ -451,9 +451,14 @@ func cmdList() {
 		}
 		host := ""
 		if s.RemoteHost != "" {
-			host = "  <" + s.RemoteHost + ">"
+			host = "  <" + proto.SanitizeTerminal(s.RemoteHost) + ">"
 		}
-		fmt.Printf("%-40s %-9s %s in %s%s\n", s.Name, status, label, s.Agent.WorkDir, host)
+		// Session metadata is derived from untrusted /proc + utmp data; strip
+		// control bytes so a crafted dir/cmdline name cannot inject terminal
+		// escape sequences into the operator's terminal.
+		fmt.Printf("%-40s %-9s %s in %s%s\n",
+			proto.SanitizeTerminal(s.Name), status,
+			proto.SanitizeTerminal(label), proto.SanitizeTerminal(s.Agent.WorkDir), host)
 	}
 }
 
