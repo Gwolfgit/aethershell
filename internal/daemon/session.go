@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Gwolfgit/aethershell/internal/proto"
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
 )
@@ -35,6 +36,11 @@ type attachment struct {
 	id       int64
 	clientID string
 	takeover chan struct{}
+	// switchTo carries a tmux-like "switch-client" directive to the streaming
+	// loop: when an in-session command asks to move this terminal to another
+	// session, the target is delivered here. Buffered so the requester never
+	// blocks. Read once, then the stream ends.
+	switchTo chan proto.SwitchTarget
 }
 
 var ErrSessionAttached = errors.New("session already in use")
@@ -243,9 +249,27 @@ func (s *Session) ClaimAttachment(clientID string, force bool) (*attachment, err
 		id:       s.attachID,
 		clientID: clientID,
 		takeover: make(chan struct{}),
+		switchTo: make(chan proto.SwitchTarget, 1),
 	}
 	s.active = a
 	return a, nil
+}
+
+// RequestSwitch asks the client currently streaming this session to switch in
+// place to target. Returns false if no client is attached or a switch is
+// already pending. Non-blocking.
+func (s *Session) RequestSwitch(target proto.SwitchTarget) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		return false
+	}
+	select {
+	case s.active.switchTo <- target:
+		return true
+	default:
+		return false
+	}
 }
 
 // ReleaseAttachment marks this session detached if the releasing stream is

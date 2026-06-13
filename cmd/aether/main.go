@@ -15,9 +15,9 @@
 //	aether --login              # smart login entrypoint (used by the profile.d hook)
 //	aether ssh <host>           # reconnecting OpenSSH wrapper
 //	aether ts <host>            # reconnecting Tailscale SSH wrapper
-//	aether --menu               # interactive session chooser (from within a session)
-//	aether --new                # create a new session (from within a session)
-//	aether --attach <name>      # attach to a session by name
+//	aether --menu               # session chooser; from within a session it switches in place
+//	aether --new                # new session; from within a session, switches the terminal to it
+//	aether --attach <name>      # attach a session by name; from within a session, switches in place
 //	aether --list               # list sessions (for scripting)
 //	aether --kill <name>        # kill a session
 //	aether --takeover <name>    # force-attach a stale busy session
@@ -206,6 +206,28 @@ func isInteractive() bool {
 	stdin, _ := os.Stdin.Stat()
 	stdout, _ := os.Stdout.Stat()
 	return (stdin.Mode()&os.ModeCharDevice) != 0 && (stdout.Mode()&os.ModeCharDevice) != 0
+}
+
+// insideSession reports whether this aether invocation is running inside an
+// aether-managed session (the daemon sets AETHER_SESSION in each session shell).
+// When true, navigation switches the existing terminal in place instead of
+// nesting a second client inside the current session.
+func insideSession() bool {
+	return os.Getenv("AETHER_SESSION") != ""
+}
+
+// currentTTY returns this process's controlling pseudo-terminal as "pts/N", used
+// to tell the daemon which session to switch away from. Empty if it can't be
+// determined (e.g. stdin is not a pts).
+func currentTTY() string {
+	for _, fd := range []string{"0", "1", "2"} {
+		if l, err := os.Readlink("/proc/self/fd/" + fd); err == nil {
+			if strings.HasPrefix(l, "/dev/pts/") {
+				return strings.TrimPrefix(l, "/dev/")
+			}
+		}
+	}
+	return ""
 }
 
 // isRemote reports whether this login originated from a remote host. SSH (incl.
@@ -403,11 +425,22 @@ func cmdMenu() {
 		fmt.Fprintf(os.Stderr, "aether: %v\n", err)
 		os.Exit(1)
 	}
+	if insideSession() {
+		runChooserLoopInSession(c, sessions, currentTTY())
+		return
+	}
 	runChooserLoop(c, sessions, cleanClientID(os.Getenv("AETHERSHELL_CLIENT_ID")))
 }
 
 func cmdNew() {
 	c := ensureClient()
+	if insideSession() {
+		if err := c.SwitchInPlace(currentTTY(), "", false, true, client.CurrentGeometry()); err != nil {
+			fmt.Fprintf(os.Stderr, "aether: new: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := createSession(c, cleanClientID(os.Getenv("AETHERSHELL_CLIENT_ID"))); err != nil {
 		fmt.Fprintf(os.Stderr, "aether: create: %v\n", err)
 		os.Exit(1)
@@ -416,6 +449,13 @@ func cmdNew() {
 
 func cmdAttach(name string) {
 	c := ensureClient()
+	if insideSession() {
+		if err := c.SwitchInPlace(currentTTY(), name, false, false, client.CurrentGeometry()); err != nil {
+			fmt.Fprintf(os.Stderr, "aether: switch: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := attachSession(c, name, cleanClientID(os.Getenv("AETHERSHELL_CLIENT_ID"))); err != nil {
 		fmt.Fprintf(os.Stderr, "aether: attach: %v\n", err)
 		os.Exit(1)
@@ -424,9 +464,84 @@ func cmdAttach(name string) {
 
 func cmdTakeover(name string) {
 	c := ensureClient()
+	if insideSession() {
+		if err := c.SwitchInPlace(currentTTY(), name, true, false, client.CurrentGeometry()); err != nil {
+			fmt.Fprintf(os.Stderr, "aether: switch: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := takeoverSession(c, name, cleanClientID(os.Getenv("AETHERSHELL_CLIENT_ID"))); err != nil {
 		fmt.Fprintf(os.Stderr, "aether: take over: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// runChooserLoopInSession is the chooser when invoked from inside a session.
+// Selecting another session switches the existing terminal to it in place (via
+// the daemon) rather than nesting a new client; management actions act directly.
+func runChooserLoopInSession(c *client.Client, sessions []proto.Session, tty string) {
+	if tty == "" {
+		fmt.Fprintln(os.Stderr, "aether: cannot determine current tty; not switching")
+		return
+	}
+	message := ""
+	refresh := func() {
+		if s, err := c.ListSessions(); err == nil {
+			sessions = s
+		}
+	}
+	for {
+		choice := client.RunChooser(sessions, message)
+		message = ""
+		switch choice.Action {
+		case "attach":
+			if err := c.SwitchInPlace(tty, choice.Name, false, false, client.CurrentGeometry()); err != nil {
+				message = "switch failed: " + err.Error()
+				continue
+			}
+			return
+		case "takeover":
+			if err := c.SwitchInPlace(tty, choice.Name, true, false, client.CurrentGeometry()); err != nil {
+				message = "switch failed: " + err.Error()
+				continue
+			}
+			return
+		case "new":
+			if err := c.SwitchInPlace(tty, "", false, true, client.CurrentGeometry()); err != nil {
+				message = "switch failed: " + err.Error()
+				continue
+			}
+			return
+		case "kill":
+			if err := c.KillSession(choice.Name); err != nil {
+				message = "terminate failed: " + err.Error()
+			} else {
+				message = "terminated " + choice.Name
+			}
+			refresh()
+		case "restart":
+			if err := c.RestartSession(choice.Name); err != nil {
+				message = "restart failed: " + err.Error()
+			} else {
+				message = "restarted " + choice.Name
+			}
+			refresh()
+		case "kill_all":
+			if err := c.KillAllSessions(); err != nil {
+				message = "terminate all failed: " + err.Error()
+			}
+			refresh()
+		case "restart_all":
+			if err := c.RestartAllSessions(); err != nil {
+				message = "restart all failed: " + err.Error()
+			} else {
+				message = "restarted all sessions"
+			}
+			refresh()
+		case "quit":
+			return
+		}
 	}
 }
 

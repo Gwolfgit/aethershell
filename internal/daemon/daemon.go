@@ -339,6 +339,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	case "attach_client":
 		s.handleAttachClient(conn, br, req.ClientID, geoFromReq(req))
 
+	case "switch":
+		s.handleSwitch(conn, req)
+
 	case "kill":
 		s.handleKill(conn, req.Name)
 
@@ -510,6 +513,77 @@ func (s *Server) handleAttachClient(conn net.Conn, br *bufio.Reader, clientID st
 	s.mu.Unlock()
 
 	s.streamSession(conn, br, sess, att)
+}
+
+// handleSwitch implements tmux-like switch-client. An in-session command running
+// on tty req.FromTTY asks whichever client is currently viewing that session to
+// attach a different session in place (req.Target), or a freshly created one
+// (req.New), instead of nesting a second client inside the first. The current
+// session is found by its controlling tty, so it survives session renames.
+func (s *Server) handleSwitch(conn net.Conn, req proto.Request) {
+	if req.FromTTY == "" {
+		s.sendError(conn, "switch: missing source tty")
+		return
+	}
+
+	s.mu.Lock()
+	cur := s.findByTTYLocked(req.FromTTY)
+	if cur == nil {
+		s.mu.Unlock()
+		s.sendError(conn, "switch: no managed session on "+req.FromTTY)
+		return
+	}
+
+	var (
+		targetName string
+		created    *Session
+	)
+	if req.New {
+		name := s.uniqueSessionNameLocked()
+		sess, err := NewSession(name, geoFromReq(req), "")
+		if err != nil {
+			s.mu.Unlock()
+			s.sendError(conn, "switch: create session: "+err.Error())
+			return
+		}
+		s.sessions[name] = sess
+		s.order = append(s.order, name)
+		targetName, created = name, sess
+	} else {
+		if req.Target == "" || s.sessions[req.Target] == nil {
+			s.mu.Unlock()
+			s.sendError(conn, "switch: target session not found: "+req.Target)
+			return
+		}
+		targetName = req.Target
+	}
+	s.mu.Unlock()
+
+	if !cur.RequestSwitch(proto.SwitchTarget{Name: targetName, Force: req.Force}) {
+		// No live client to redirect; don't leave a freshly created session orphaned.
+		if created != nil {
+			s.mu.Lock()
+			created.Kill()
+			delete(s.sessions, targetName)
+			s.order = removeStr(s.order, targetName)
+			s.mu.Unlock()
+		}
+		s.sendError(conn, "switch: current session has no attached client")
+		return
+	}
+	json.NewEncoder(conn).Encode(proto.Response{Type: "ok"})
+}
+
+// findByTTYLocked returns the managed session whose PTY slave is the given tty
+// (e.g. "pts/7"), or nil. Caller must hold s.mu.
+func (s *Server) findByTTYLocked(tty string) *Session {
+	for _, name := range s.order {
+		sess := s.sessions[name]
+		if sess != nil && sess.PtsName() == tty {
+			return sess
+		}
+	}
+	return nil
 }
 
 // handleKill destroys a session.
@@ -790,6 +864,13 @@ func (s *Server) streamSession(conn net.Conn, br *bufio.Reader, sess *Session, a
 		case <-done: // client detached or disconnected
 			return
 		case <-att.takeover:
+			return
+		case target := <-att.switchTo:
+			// In-session switch-client: tell the client to attach `target` in
+			// place of this session, then end the stream.
+			if b, err := json.Marshal(target); err == nil {
+				_ = proto.WriteFrame(conn, proto.FrameSwitch, b)
+			}
 			return
 		case <-titleTick.C:
 			if !writeTitle(false) {

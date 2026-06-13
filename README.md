@@ -150,6 +150,13 @@ two-line status bar at the bottom shows the keys:
 External rows ignore attach/kill/restart (a notice explains why). The chooser
 uses raw ANSI control sequences — no `tput`/terminfo dependency.
 
+**Switch in place.** When you run `aether --menu`, `aether --attach <name>`, or
+`aether --new` *from inside an existing session*, aether moves your current
+terminal to the chosen session — like `tmux switch-client` — instead of nesting
+a second viewer inside the first. This avoids leaving a hidden client attached to
+a session you've navigated away from (which would otherwise keep that session
+pinned "in use").
+
 ## Layout
 
 ```

@@ -16,6 +16,18 @@ type Request struct {
 	Cols     int    `json:"cols,omitempty"`
 	XPixel   int    `json:"xpixel,omitempty"` // terminal width in pixels (0 if unknown)
 	YPixel   int    `json:"ypixel,omitempty"` // terminal height in pixels (0 if unknown)
+
+	// --- switch-in-place (type "switch") ---
+	FromTTY string `json:"from_tty,omitempty"` // tty of the requesting in-session client, e.g. "pts/7"
+	Target  string `json:"target,omitempty"`   // session to switch the current viewer to
+	New     bool   `json:"new,omitempty"`      // create a fresh session and switch to it
+}
+
+// SwitchTarget is the payload of a FrameSwitch directive (daemon → client): the
+// session the client should attach in place of the current one.
+type SwitchTarget struct {
+	Name  string `json:"name"`
+	Force bool   `json:"force,omitempty"`
 }
 
 // --- Daemon → Client responses ---

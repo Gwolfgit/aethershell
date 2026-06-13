@@ -22,6 +22,12 @@ const (
 	FrameData   byte = 'd' // raw PTY bytes
 	FrameResize byte = 'r' // payload is a JSON-encoded Control
 	FrameDetach byte = 'x' // client is leaving; no payload
+	// FrameSwitch (daemon → client) tells the attached client to detach from the
+	// current session and attach a different one in place — a tmux-like
+	// switch-client. Payload is a JSON-encoded SwitchTarget. It is how an
+	// in-session `aether --menu/--attach/--new` moves the real terminal to
+	// another session instead of nesting a second client inside the first.
+	FrameSwitch byte = 's'
 )
 
 // maxFrame bounds a single payload to guard against a corrupt/hostile length
