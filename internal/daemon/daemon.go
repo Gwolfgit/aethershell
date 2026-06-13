@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,10 +24,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// handshakeTimeout bounds how long a connection may take to send its initial
+// JSON request line. Without it, a client that connects and never sends a
+// newline parks a handler goroutine (and an fd) indefinitely; many such
+// connections exhaust the daemon. The deadline is cleared once a stream is
+// established, since attach connections are intentionally long-lived.
+// It is a var only so tests can shorten it.
+var handshakeTimeout = 15 * time.Second
+
+// maxConcurrentConns bounds in-flight connection handlers so a flood of
+// half-open connections cannot exhaust goroutines/fds. Legitimate use (a
+// handful of attached terminals plus the occasional list/management call) is
+// far below this.
+const maxConcurrentConns = 256
+
 // Server is the aether daemon: manages PTY sessions and serves client
 // connections over a Unix domain socket.
 type Server struct {
 	socketPath string
+
+	connCount int32 // atomic: in-flight handleConn count
 
 	lnMu      sync.Mutex
 	listener  net.Listener
@@ -271,6 +288,14 @@ func socketPresent(path string) (bool, uint64) {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Bound concurrent handlers so a half-open flood cannot exhaust the daemon.
+	n := atomic.AddInt32(&s.connCount, 1)
+	defer atomic.AddInt32(&s.connCount, -1)
+	if n > maxConcurrentConns {
+		log.Printf("aetherd: too many concurrent connections (%d); dropping", n)
+		return
+	}
+
 	// Defense in depth: only this user's processes may talk to the daemon, even
 	// if the socket/runtime-dir permissions are ever loosened.
 	if !s.authorizePeer(conn) {
@@ -279,6 +304,10 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	br := bufio.NewReader(conn)
 
+	// Bound the handshake: a connection that never sends a request line must not
+	// pin a goroutine/fd forever.
+	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+
 	// The client encodes its request with json.Encoder, which appends a newline.
 	// Read exactly that line so all subsequent bytes remain buffered for frames.
 	line, err := br.ReadBytes('\n')
@@ -286,6 +315,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.sendError(conn, "bad request: "+err.Error())
 		return
 	}
+
+	// Request line received; clear the deadline so attach streams (which are
+	// long-lived and idle between keystrokes) are not torn down.
+	_ = conn.SetReadDeadline(time.Time{})
 	var req proto.Request
 	if err := json.Unmarshal(line, &req); err != nil {
 		s.sendError(conn, "bad request: "+err.Error())
@@ -559,6 +592,11 @@ func (s *Server) handleUpgrade(conn net.Conn) {
 		return
 	}
 	defer listenerFile.Close()
+	// On a successful exec this process is replaced and the new daemon removes
+	// the state file after reading it. These deferred cleanups only run if the
+	// upgrade fails, so a failed upgrade does not leave session metadata
+	// (names, client IDs) lingering on disk.
+	defer os.Remove(statePath)
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -631,6 +669,7 @@ func (s *Server) prepareUpgrade() (string, *os.File, error) {
 			ClientID:    sess.ClientID,
 			LastUnix:    lastAttached.UnixNano(),
 			ShellPID:    sess.shellPid,
+			ShellStart:  sess.shellStart,
 			Geometry:    geo,
 			PTYFD:       int(sess.pty.Fd()),
 		})

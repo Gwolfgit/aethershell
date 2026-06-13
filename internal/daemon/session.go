@@ -22,6 +22,7 @@ type Session struct {
 	cmd          *exec.Cmd
 	pty          *os.File // PTY master fd; kept open so shell survives client detach
 	shellPid     int
+	shellStart   uint64     // /proc/<pid>/stat starttime; detects PID reuse after restore
 	hub          *outputHub // drains the PTY, keeps scrollback, fans out to clients
 
 	mu       sync.Mutex
@@ -107,6 +108,7 @@ func NewSession(name string, geo Geometry, clientID string) (*Session, error) {
 	}
 
 	now := time.Now()
+	start, _ := procStartTicks(cmd.Process.Pid)
 	sess := &Session{
 		Name:         name,
 		Created:      now,
@@ -115,6 +117,7 @@ func NewSession(name string, geo Geometry, clientID string) (*Session, error) {
 		cmd:          cmd,
 		pty:          f,
 		shellPid:     cmd.Process.Pid,
+		shellStart:   start,
 		geo:          geo,
 		hub:          newOutputHub(),
 	}
@@ -198,6 +201,15 @@ func (s *Session) IsAlive() bool {
 	}
 	if err := syscall.Kill(pid, 0); err != nil {
 		return false
+	}
+	// PID-reuse guard: if we recorded the shell's start-time, the live process
+	// at this PID must still be that same instance. After a hot-upgrade a dead
+	// shell's PID can be recycled by an unrelated process; treat that as dead so
+	// we never adopt — or later kill — someone else's process.
+	if s.shellStart != 0 {
+		if start, ok := procStartTicks(pid); ok && start != s.shellStart {
+			return false
+		}
 	}
 	data, err := os.ReadFile("/proc/" + fmt.Sprint(pid) + "/stat")
 	if err != nil {
@@ -316,6 +328,7 @@ func (s *Session) RestartShell() error {
 	}
 	s.cmd = cmd
 	s.shellPid = cmd.Process.Pid
+	s.shellStart, _ = procStartTicks(cmd.Process.Pid)
 	return nil
 }
 
@@ -325,7 +338,15 @@ func (s *Session) killShell() {
 		s.cmd.Process.Wait()
 		return
 	}
+	// Restored session (no os/exec handle): signal the raw PID, but only after
+	// confirming it is still the same process we recorded. Without this check a
+	// recycled PID belonging to an unrelated same-user process would be killed.
 	if s.shellPid > 0 {
+		if s.shellStart != 0 {
+			if start, ok := procStartTicks(s.shellPid); !ok || start != s.shellStart {
+				return
+			}
+		}
 		_ = syscall.Kill(s.shellPid, syscall.SIGKILL)
 	}
 }

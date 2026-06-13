@@ -24,6 +24,7 @@ type restoreSession struct {
 	ClientID    string   `json:"client_id,omitempty"`
 	LastUnix    int64    `json:"last_unix"`
 	ShellPID    int      `json:"shell_pid"`
+	ShellStart  uint64   `json:"shell_start,omitempty"` // /proc starttime; PID-reuse guard
 	Geometry    Geometry `json:"geometry"`
 	PTYFD       int      `json:"pty_fd"`
 }
@@ -72,6 +73,16 @@ func Restore(socketPath, statePath string) (*Server, net.Listener, error) {
 		if ptyFile == nil {
 			continue
 		}
+		// Re-verify the PID still belongs to the same process we snapshotted.
+		// If the start-time we recorded no longer matches, the shell exited and
+		// the PID was recycled — drop the session rather than adopt (and later
+		// kill) an unrelated process.
+		if meta.ShellStart != 0 {
+			if start, ok := procStartTicks(meta.ShellPID); !ok || start != meta.ShellStart {
+				ptyFile.Close()
+				continue
+			}
+		}
 		sess := &Session{
 			Name:         meta.Name,
 			Created:      time.Unix(0, meta.CreatedUnix),
@@ -79,6 +90,7 @@ func Restore(socketPath, statePath string) (*Server, net.Listener, error) {
 			LastAttached: time.Unix(0, meta.LastUnix),
 			pty:          ptyFile,
 			shellPid:     meta.ShellPID,
+			shellStart:   meta.ShellStart,
 			geo:          meta.Geometry,
 			hub:          newOutputHub(),
 		}
