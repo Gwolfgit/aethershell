@@ -106,7 +106,10 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   It does not start or talk to a local `aetherd`; it only runs the reconnecting
   transport and asks the remote host to run `aether --login`. By default,
   `aether-connect host` uses Tailscale SSH. Use `aether-connect ssh host` for
-  OpenSSH.
+  OpenSSH. When Tailscale is in use, a short hostname is resolved to its
+  Tailscale IP automatically (so `aether-connect ssh cosmo` works without
+  MagicDNS configured for plain OpenSSH); for non-Tailscale hosts the
+  destination is passed through unchanged.
 - **`aether`** — invoked for remote logins by the `/etc/profile.d/aether.sh`
   hook (login shell stays `/bin/bash`) or explicitly by the reconnect wrapper.
   Detects interactive vs non-interactive and remote vs local use, connects to

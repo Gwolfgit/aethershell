@@ -41,6 +41,9 @@ func usage() {
   aether-connect ts [tailscale ssh opts] host # Tailscale SSH
   aether-connect ssh [ssh opts] host          # OpenSSH
 
+Short Tailscale hostnames are resolved to their Tailscale IP automatically
+(e.g. aether-connect ssh cosmo), but only when Tailscale is in use.
+
 The local machine only needs this connector binary plus tailscale/ssh.
 The remote host must have aether installed.`)
 }

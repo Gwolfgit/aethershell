@@ -32,6 +32,14 @@ func SSHWithUsage(args []string, usage string) int {
 		return 1
 	}
 
+	// Resolve a short Tailscale hostname to its Tailscale IP if Tailscale is in
+	// use. OpenSSH cannot resolve MagicDNS short names on its own; this lets
+	// `aether-connect ssh core` work the way `tailscale ssh core` would. It is a
+	// no-op for public hosts (no tailscale / no matching peer).
+	if host, ok := resolveTailscaleDest(args); ok {
+		fmt.Fprintf(os.Stderr, "aether: resolved %s via Tailscale\n", host)
+	}
+
 	base := []string{
 		"-tt",
 		"-o", "ServerAliveInterval=10",
@@ -67,6 +75,11 @@ func TailscaleWithUsage(args []string, usage string) int {
 		fmt.Fprintf(os.Stderr, "aether: generate client id: %v\n", err)
 		return 1
 	}
+
+	// `tailscale ssh` resolves MagicDNS short names natively, but resolve here
+	// too so it still works when MagicDNS is disabled and to keep behavior
+	// identical to the OpenSSH path. No-op when the host is not a known peer.
+	resolveTailscaleDest(args)
 
 	base := []string{"ssh"}
 	base = append(base, args...)
