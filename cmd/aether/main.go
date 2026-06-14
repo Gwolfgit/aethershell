@@ -139,6 +139,20 @@ func main() {
 // engage (local console, already nested, daemon trouble, or disabled).
 func loginFlow() {
 	if !isInteractive() {
+		// No usable TTY on this connection. If aether was explicitly asked to
+		// handle a remote login (the reconnect wrapper sets AETHERSHELL_FORCE_REMOTE)
+		// the user wanted an interactive session, but their SSH client did not
+		// allocate a PTY (e.g. missing `-t`/`-tt`). Persistent aether sessions are
+		// PTY-backed and cannot work here — but DO NOT hand back a silent,
+		// prompt-less /bin/bash that just looks like a hang. Explain why and give a
+		// real interactive shell so the user can see the message and keep working.
+		if os.Getenv("AETHERSHELL_FORCE_REMOTE") != "" {
+			fmt.Fprintln(os.Stderr, "aether: no TTY was allocated for this connection, so persistent sessions are unavailable.")
+			fmt.Fprintln(os.Stderr, "aether: reconnect with a TTY for full aether — e.g. `tailscale ssh user@host`, `ssh -tt user@host`, or update aether-connect.")
+			execInteractiveShell()
+			return
+		}
+		// scp/rsync/sftp and `ssh host <cmd>` legitimately have no TTY: pass through.
 		execBinary("/bin/bash")
 		return
 	}
@@ -244,6 +258,16 @@ func execBinary(bin string, args ...string) {
 	argv := append([]string{bin}, args...)
 	if err := syscall.Exec(bin, argv, os.Environ()); err != nil {
 		log.Fatalf("exec %s: %v", bin, err)
+	}
+}
+
+// execInteractiveShell replaces the process with an interactive bash. Unlike
+// execBinary("/bin/bash"), the `-i` flag forces a prompt even when stdin is not
+// a TTY (a pipe), so a connection without a PTY gets a usable prompt instead of
+// a silent, prompt-less shell.
+func execInteractiveShell() {
+	if err := syscall.Exec("/bin/bash", []string{"/bin/bash", "-i"}, os.Environ()); err != nil {
+		log.Fatalf("exec /bin/bash -i: %v", err)
 	}
 }
 
@@ -425,7 +449,7 @@ func cmdMenu() {
 		fmt.Fprintf(os.Stderr, "aether: %v\n", err)
 		os.Exit(1)
 	}
-	if insideSession() {
+	if insideSession() && c.SupportsSwitch() {
 		runChooserLoopInSession(c, sessions, currentTTY())
 		return
 	}
@@ -434,7 +458,7 @@ func cmdMenu() {
 
 func cmdNew() {
 	c := ensureClient()
-	if insideSession() {
+	if insideSession() && c.SupportsSwitch() {
 		if err := c.SwitchInPlace(currentTTY(), "", false, true, client.CurrentGeometry()); err != nil {
 			fmt.Fprintf(os.Stderr, "aether: new: %v\n", err)
 			os.Exit(1)
@@ -449,7 +473,7 @@ func cmdNew() {
 
 func cmdAttach(name string) {
 	c := ensureClient()
-	if insideSession() {
+	if insideSession() && c.SupportsSwitch() {
 		if err := c.SwitchInPlace(currentTTY(), name, false, false, client.CurrentGeometry()); err != nil {
 			fmt.Fprintf(os.Stderr, "aether: switch: %v\n", err)
 			os.Exit(1)
@@ -464,7 +488,7 @@ func cmdAttach(name string) {
 
 func cmdTakeover(name string) {
 	c := ensureClient()
-	if insideSession() {
+	if insideSession() && c.SupportsSwitch() {
 		if err := c.SwitchInPlace(currentTTY(), name, true, false, client.CurrentGeometry()); err != nil {
 			fmt.Fprintf(os.Stderr, "aether: switch: %v\n", err)
 			os.Exit(1)

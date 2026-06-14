@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -139,6 +140,27 @@ func (c *Client) sendSimple(reqType, name string) error {
 		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
+}
+
+// SupportsSwitch reports whether the daemon understands the "switch" request.
+// During an upgrade the client may briefly talk to an older daemon; callers use
+// this to fall back to nested attach instead of erroring.
+func (c *Client) SupportsSwitch() bool {
+	conn, err := net.Dial("unix", c.socketPath)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(proto.Request{Type: "switch"}); err != nil {
+		return false
+	}
+	var resp proto.Response
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return false
+	}
+	// New daemon rejects the empty request with a switch-specific error; an old
+	// daemon answers "unknown request type".
+	return !strings.Contains(resp.Error, "unknown request type")
 }
 
 // SwitchInPlace asks the daemon to move the client currently viewing the session
