@@ -40,6 +40,14 @@ func SSHWithUsage(args []string, usage string) int {
 		fmt.Fprintf(os.Stderr, "aether: resolved %s via Tailscale\n", host)
 	}
 
+	base := sshTransportArgs(args, clientID)
+
+	return runReconnectingTransport("ssh", base, func(code int) bool {
+		return code == 255
+	})
+}
+
+func sshTransportArgs(args []string, clientID string) []string {
 	base := []string{
 		"-tt",
 		"-o", "ServerAliveInterval=10",
@@ -48,10 +56,7 @@ func SSHWithUsage(args []string, usage string) int {
 	}
 	base = append(base, args...)
 	base = append(base, remoteLoginCommand(clientID))
-
-	return runReconnectingTransport("ssh", base, func(code int) bool {
-		return code == 255
-	})
+	return base
 }
 
 // Tailscale runs `tailscale ssh` in a reconnect loop. This path does not
@@ -81,9 +86,7 @@ func TailscaleWithUsage(args []string, usage string) int {
 	// identical to the OpenSSH path. No-op when the host is not a known peer.
 	resolveTailscaleDest(args)
 
-	base := []string{"ssh"}
-	base = append(base, args...)
-	base = append(base, remoteLoginCommand(clientID))
+	base := tailscaleTransportArgs(args, clientID)
 
 	return runReconnectingTransport("tailscale", base, func(code int) bool {
 		// tailscale ssh does not use OpenSSH's conventional 255 transport
@@ -91,6 +94,13 @@ func TailscaleWithUsage(args []string, usage string) int {
 		// treated as reconnectable; the user can stop the loop with Ctrl+C.
 		return code != 0 && code != 130
 	})
+}
+
+func tailscaleTransportArgs(args []string, clientID string) []string {
+	base := []string{"ssh"}
+	base = append(base, args...)
+	base = append(base, tailscaleRemoteLoginCommand(clientID))
+	return base
 }
 
 func clientID() (string, error) {
@@ -111,6 +121,12 @@ func cleanClientID(clientID string) string {
 
 func remoteLoginCommand(clientID string) string {
 	return "AETHERSHELL_CLIENT_ID=" + shellQuote(clientID) + " AETHERSHELL_FORCE_REMOTE=1 exec aether --login"
+}
+
+func tailscaleRemoteLoginCommand(clientID string) string {
+	login := shellQuote(remoteLoginCommand(clientID))
+	return "if command -v script >/dev/null 2>&1; then exec script -q /dev/null -c " + login + "; " +
+		"else echo 'aether: tailscale ssh cannot allocate a TTY for remote commands and script(1) is missing; use aether-connect ssh host' >&2; exit 127; fi"
 }
 
 func runReconnectingTransport(bin string, args []string, shouldReconnect func(int) bool) int {

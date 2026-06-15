@@ -109,7 +109,9 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   OpenSSH. When Tailscale is in use, a short hostname is resolved to its
   Tailscale IP automatically (so `aether-connect ssh cosmo` works without
   MagicDNS configured for plain OpenSSH); for non-Tailscale hosts the
-  destination is passed through unchanged.
+  destination is passed through unchanged. Tailscale SSH does not expose
+  OpenSSH's forced-TTY flag for remote commands, so the connector runs the
+  remote login through `script(1)` to provide the PTY that aether requires.
 - **`aether`** — invoked for remote logins by the `/etc/profile.d/aether.sh`
   hook (login shell stays `/bin/bash`) or explicitly by the reconnect wrapper.
   Detects interactive vs non-interactive and remote vs local use, connects to
