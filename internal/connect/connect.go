@@ -129,10 +129,31 @@ func tailscaleRemoteLoginCommand(clientID string) string {
 		"else echo 'aether: tailscale ssh cannot allocate a TTY for remote commands and script(1) is missing; use aether-connect ssh host' >&2; exit 127; fi"
 }
 
+const (
+	// healthyUptime is how long a transport must stay connected before we treat
+	// the connection as genuinely established. A drop after this resets the
+	// failure streak and backoff, so a laptop roaming between networks (or a
+	// long session that occasionally blips) reconnects indefinitely.
+	healthyUptime = 20 * time.Second
+	// initialBackoff and maxBackoff bound the exponential backoff between
+	// reconnect attempts. Capping the delay keeps a wedged target from spinning
+	// in a tight loop while still retrying often enough for roaming clients.
+	initialBackoff = time.Second
+	maxBackoff     = 30 * time.Second
+	// maxRapidFailures caps consecutive failures that never stayed connected
+	// (died in under healthyUptime). Hitting it means the target is effectively
+	// unusable — give up instead of spawning reconnect attempts (and remote
+	// sessions) forever. A connection that lasts healthyUptime resets the count,
+	// so this never interferes with normal roaming.
+	maxRapidFailures = 12
+)
+
 func runReconnectingTransport(bin string, args []string, shouldReconnect func(int) bool) int {
-	backoff := time.Second
+	backoff := initialBackoff
+	rapidFailures := 0
 	reported := false
 	for {
+		start := time.Now()
 		cmd := exec.Command(bin, args...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -147,13 +168,31 @@ func runReconnectingTransport(bin string, args []string, shouldReconnect func(in
 			fmt.Fprintf(os.Stderr, "aether: %s exited: %v\n", bin, err)
 			return code
 		}
+
+		if time.Since(start) >= healthyUptime {
+			// The connection was real and later dropped: not a runaway, just a
+			// network blip. Reset so roaming reconnects without limit.
+			rapidFailures = 0
+			backoff = initialBackoff
+		} else {
+			rapidFailures++
+			if rapidFailures >= maxRapidFailures {
+				fmt.Fprintf(os.Stderr, "\r\naether: %s failed %d times without staying connected; giving up.\n", bin, rapidFailures)
+				fmt.Fprintln(os.Stderr, "aether: check the host is reachable and that the transport allocates a TTY (try `aether-connect ssh host`).")
+				return code
+			}
+		}
+
 		if !reported {
 			fmt.Fprintln(os.Stderr, "\r\naether: reconnecting...")
 			reported = true
 		}
 		time.Sleep(backoff)
-		if backoff < 5*time.Second {
+		if backoff < maxBackoff {
 			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }
