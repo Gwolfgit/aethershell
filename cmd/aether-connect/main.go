@@ -12,7 +12,7 @@ import (
 	"github.com/Gwolfgit/aethershell/internal/connect"
 )
 
-const version = "2.0.1"
+const version = "2.0.2"
 
 func main() {
 	if len(os.Args) > 1 {
