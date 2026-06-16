@@ -58,13 +58,13 @@ func (c *Client) ListSessions() ([]proto.Session, error) {
 // CreateSession creates a new session and attaches to it.
 // On success, the caller's terminal is set to raw mode and PTY I/O begins.
 func (c *Client) CreateSession() error {
-	return c.doAttach(proto.Request{Type: "create"})
+	return c.doAttach(proto.Request{Type: "create", Env: ConnEnv()})
 }
 
 // CreateSessionForClient creates a new session associated with a stable client
 // identity and attaches to it.
 func (c *Client) CreateSessionForClient(clientID string) error {
-	return c.doAttach(proto.Request{Type: "create", ClientID: clientID})
+	return c.doAttach(proto.Request{Type: "create", ClientID: clientID, Env: ConnEnv()})
 }
 
 // AttachSession attaches to an existing session by name.
@@ -179,6 +179,11 @@ func (c *Client) SwitchInPlace(fromTTY, target string, force, newSession bool, g
 	req := proto.Request{
 		Type: "switch", FromTTY: fromTTY, Target: target, Force: force, New: newSession,
 		Rows: geo.Rows, Cols: geo.Cols, XPixel: geo.XPixel, YPixel: geo.YPixel,
+	}
+	if newSession {
+		// A switch that spawns a fresh session should seed it with the current
+		// connection environment, same as a top-level create.
+		req.Env = ConnEnv()
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("send request: %w", err)

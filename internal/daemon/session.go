@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,8 +25,9 @@ type Session struct {
 	cmd          *exec.Cmd
 	pty          *os.File // PTY master fd; kept open so shell survives client detach
 	shellPid     int
-	shellStart   uint64     // /proc/<pid>/stat starttime; detects PID reuse after restore
-	hub          *outputHub // drains the PTY, keeps scrollback, fans out to clients
+	shellStart   uint64            // /proc/<pid>/stat starttime; detects PID reuse after restore
+	connEnv      map[string]string // forwarded connection env (TERM, LANG, LC_*, SSH_*); reused on restart
+	hub          *outputHub        // drains the PTY, keeps scrollback, fans out to clients
 
 	mu       sync.Mutex
 	active   *attachment // current client streaming this session, if any
@@ -91,19 +94,49 @@ func (g Geometry) envVars() []string {
 	}
 }
 
+// buildSessionEnv composes the environment for a session's shell. The base is
+// the daemon's (i.e. the user account's) environment for PATH/HOME/USER/SHELL;
+// the forwarded connection environment is overlaid on top so the shell sees the
+// terminal type, locale, and connection identity the SSH layer actually
+// negotiated for this login. TERM falls back to a sane default only when the
+// connection did not supply one. aether's own session markers and the geometry
+// are applied last so they always win.
+func buildSessionEnv(name, clientID string, geo Geometry, connEnv map[string]string) []string {
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			env[kv[:eq]] = kv[eq+1:]
+		}
+	}
+	for k, v := range connEnv {
+		env[k] = v
+	}
+	if env["TERM"] == "" {
+		env["TERM"] = "xterm-256color"
+	}
+	env["AETHER_SESSION"] = name
+	if clientID != "" {
+		env["AETHERSHELL_CLIENT_ID"] = clientID
+	}
+	for _, kv := range geo.envVars() {
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			env[kv[:eq]] = kv[eq+1:]
+		}
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out) // deterministic order (helps tests and logging)
+	return out
+}
+
 // NewSession starts a shell in a new PTY and returns the session.
-func NewSession(name string, geo Geometry, clientID string) (*Session, error) {
+func NewSession(name string, geo Geometry, clientID string, connEnv map[string]string) (*Session, error) {
 	geo = geo.normalize()
 
 	cmd := exec.Command("/bin/bash")
-	cmd.Env = append(os.Environ(),
-		"AETHER_SESSION="+name,
-		"TERM=xterm-256color",
-	)
-	if clientID != "" {
-		cmd.Env = append(cmd.Env, "AETHERSHELL_CLIENT_ID="+clientID)
-	}
-	cmd.Env = append(cmd.Env, geo.envVars()...)
+	cmd.Env = buildSessionEnv(name, clientID, geo, connEnv)
 
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{
 		Rows: uint16(geo.Rows), Cols: uint16(geo.Cols),
@@ -124,6 +157,7 @@ func NewSession(name string, geo Geometry, clientID string) (*Session, error) {
 		pty:          f,
 		shellPid:     cmd.Process.Pid,
 		shellStart:   start,
+		connEnv:      connEnv,
 		geo:          geo,
 		hub:          newOutputHub(),
 	}
@@ -328,16 +362,10 @@ func (s *Session) RestartShell() error {
 	// Kill the old shell
 	s.killShell()
 
-	// Start a new shell connected to the PTY slave
+	// Start a new shell connected to the PTY slave, reusing the same connection
+	// environment the session was created with so a restart stays consistent.
 	cmd := exec.Command("/bin/bash")
-	cmd.Env = append(os.Environ(),
-		"AETHER_SESSION="+s.Name,
-		"TERM=xterm-256color",
-	)
-	if s.ClientID != "" {
-		cmd.Env = append(cmd.Env, "AETHERSHELL_CLIENT_ID="+s.ClientID)
-	}
-	cmd.Env = append(cmd.Env, s.geo.envVars()...)
+	cmd.Env = buildSessionEnv(s.Name, s.ClientID, s.geo, s.connEnv)
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave

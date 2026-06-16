@@ -17,6 +17,13 @@ type Request struct {
 	XPixel   int    `json:"xpixel,omitempty"` // terminal width in pixels (0 if unknown)
 	YPixel   int    `json:"ypixel,omitempty"` // terminal height in pixels (0 if unknown)
 
+	// Env carries the terminal/locale/connection environment the SSH layer
+	// negotiated for this login (TERM, LANG, LC_*, COLORTERM, SSH_*), forwarded
+	// from the login process so a newly created session shell inherits the real
+	// connection environment instead of the daemon's stale startup env. Only
+	// consulted when a request creates a session.
+	Env map[string]string `json:"env,omitempty"`
+
 	// --- switch-in-place (type "switch") ---
 	FromTTY string `json:"from_tty,omitempty"` // tty of the requesting in-session client, e.g. "pts/7"
 	Target  string `json:"target,omitempty"`   // session to switch the current viewer to
