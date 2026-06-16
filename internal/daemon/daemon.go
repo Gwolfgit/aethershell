@@ -38,6 +38,23 @@ var handshakeTimeout = 15 * time.Second
 // far below this.
 const maxConcurrentConns = 256
 
+// maxSessions caps the total number of live aether-managed sessions the daemon
+// will hold. Reattaching to an existing session never counts against this — only
+// fresh `create` requests do — so legitimate bursts (many terminals reconnecting
+// at once after a network change) are unaffected. The ceiling exists to stop a
+// pathological create-storm (e.g. a broken transport reconnecting and creating a
+// new session every few seconds) from accumulating thousands of detached shells.
+//
+// maxSessionsPerClient caps how many live sessions a single client id may own.
+// One workstation opening a handful of terminals stays far below this; the cap
+// only trips on a runaway client minting sessions in a loop.
+//
+// Both are vars (not consts) only so tests can lower them.
+var (
+	maxSessions          = 128
+	maxSessionsPerClient = 16
+)
+
 // Server is the aether daemon: manages PTY sessions and serves client
 // connections over a Unix domain socket.
 type Server struct {
@@ -331,7 +348,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleList(conn)
 
 	case "create":
-		s.handleCreate(conn, br, req.ClientID, geoFromReq(req))
+		s.handleCreate(conn, br, req.ClientID, geoFromReq(req), req.Env)
 
 	case "attach":
 		s.handleAttach(conn, br, req.Name, req.ClientID, req.Force, geoFromReq(req))
@@ -413,12 +430,28 @@ func geoFromReq(req proto.Request) Geometry {
 }
 
 // handleCreate creates a new session and streams it to the client.
-func (s *Server) handleCreate(conn net.Conn, br *bufio.Reader, clientID string, geo Geometry) {
+func (s *Server) handleCreate(conn net.Conn, br *bufio.Reader, clientID string, geo Geometry, connEnv map[string]string) {
 	clientID = cleanClientID(clientID)
 
+	// Reclaim dead sessions before enforcing the ceilings, so a client that keeps
+	// reconnecting after its shell exited is never blocked by its own corpses.
+	s.pruneDeadSessions()
+
 	s.mu.Lock()
+	if len(s.sessions) >= maxSessions {
+		s.mu.Unlock()
+		log.Printf("aetherd: session ceiling reached (%d); refusing create", maxSessions)
+		s.sendError(conn, fmt.Sprintf("session limit reached (%d); close some sessions and retry", maxSessions))
+		return
+	}
+	if clientID != "" && s.clientSessionCountLocked(clientID) >= maxSessionsPerClient {
+		s.mu.Unlock()
+		log.Printf("aetherd: per-client session ceiling reached (%d); refusing create", maxSessionsPerClient)
+		s.sendError(conn, fmt.Sprintf("per-client session limit reached (%d); close some sessions and retry", maxSessionsPerClient))
+		return
+	}
 	name := s.uniqueSessionNameLocked()
-	sess, err := NewSession(name, geo, clientID)
+	sess, err := NewSession(name, geo, clientID, connEnv)
 	if err != nil {
 		s.mu.Unlock()
 		s.sendError(conn, "create session: "+err.Error())
@@ -438,6 +471,18 @@ func (s *Server) handleCreate(conn net.Conn, br *bufio.Reader, clientID string, 
 	s.mu.Unlock()
 
 	s.streamSession(conn, br, sess, att)
+}
+
+// clientSessionCountLocked returns how many live sessions are owned by clientID.
+// Callers must hold s.mu.
+func (s *Server) clientSessionCountLocked(clientID string) int {
+	n := 0
+	for _, sess := range s.sessions {
+		if sess != nil && sess.ClientID == clientID {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) uniqueSessionNameLocked() string {
@@ -540,7 +585,7 @@ func (s *Server) handleSwitch(conn net.Conn, req proto.Request) {
 	)
 	if req.New {
 		name := s.uniqueSessionNameLocked()
-		sess, err := NewSession(name, geoFromReq(req), "")
+		sess, err := NewSession(name, geoFromReq(req), "", req.Env)
 		if err != nil {
 			s.mu.Unlock()
 			s.sendError(conn, "switch: create session: "+err.Error())

@@ -39,9 +39,10 @@ import (
 	"github.com/Gwolfgit/aethershell/internal/client"
 	"github.com/Gwolfgit/aethershell/internal/connect"
 	"github.com/Gwolfgit/aethershell/internal/proto"
+	"github.com/Gwolfgit/aethershell/internal/sockpath"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 func main() {
 	// --- Explicit management commands (work from anywhere) ---
@@ -272,13 +273,7 @@ func execInteractiveShell() {
 }
 
 func socketPath() string {
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		p := filepath.Join(dir, "aethershell")
-		return filepath.Join(p, "sock")
-	}
-	home, _ := os.UserHomeDir()
-	p := filepath.Join(home, ".aethershell")
-	return filepath.Join(p, "sock")
+	return sockpath.Socket()
 }
 
 func socketExists(path string) bool {

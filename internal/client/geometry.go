@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Gwolfgit/aethershell/internal/sockpath"
 	"golang.org/x/sys/unix"
 )
 
@@ -39,11 +40,7 @@ func CurrentGeometry() Geometry {
 }
 
 func geometryPath() string {
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "aethershell", "geometry.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".aethershell", "geometry.json")
+	return sockpath.Geometry()
 }
 
 func (g Geometry) save() {

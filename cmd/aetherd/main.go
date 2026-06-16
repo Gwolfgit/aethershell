@@ -4,16 +4,16 @@
 //
 // Usage: aetherd
 //
-// The socket path is $XDG_RUNTIME_DIR/aethershell/sock,
-// falling back to ~/.aethershell/sock.
+// The socket path is ~/.aethershell/sock — a single stable location so the
+// daemon and every client agree regardless of how the user connected.
 package main
 
 import (
 	"log"
 	"os"
-	"path/filepath"
 
 	"github.com/Gwolfgit/aethershell/internal/daemon"
+	"github.com/Gwolfgit/aethershell/internal/sockpath"
 )
 
 func main() {
@@ -42,18 +42,5 @@ func main() {
 }
 
 func socketPath() string {
-	// Prefer XDG_RUNTIME_DIR (per-user runtime dir, typically /run/user/<uid>)
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		p := filepath.Join(dir, "aethershell")
-		os.MkdirAll(p, 0700)
-		return filepath.Join(p, "sock")
-	}
-	// Fall back to home directory
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("cannot determine home directory: %v", err)
-	}
-	p := filepath.Join(home, ".aethershell")
-	os.MkdirAll(p, 0700)
-	return filepath.Join(p, "sock")
+	return sockpath.Socket()
 }
