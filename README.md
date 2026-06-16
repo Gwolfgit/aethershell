@@ -6,11 +6,11 @@
 
 `aethershell` is a Go-native login shell wrapper: every interactive SSH session
 is backed by a per-user **aetherd** daemon managing persistent PTY sessions,
-with no tmux or screen dependency. It works with OpenSSH, Tailscale SSH,
-Dropbear — anything that invokes a login shell with a TTY — and it is especially
-smooth over Tailscale. Close your laptop at home, reopen it at a nearby cafe,
-and reconnect to the same shell with your coding agent, editor, and long-running
-jobs still exactly where you left them.
+with no tmux or screen dependency. It works with a standard OpenSSH client, and
+the transport can be Tailscale SSH, OpenSSH, or Dropbear — anything that
+invokes a login shell with a TTY. Close your laptop at home, reopen it at a
+nearby cafe, and reconnect to the same shell with your coding agent, editor,
+and long-running jobs still exactly where you left them.
 
 ---
 
@@ -30,11 +30,11 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   sessions directly; the client (`aether`) connects over a Unix socket and
   pipes I/O to your terminal. No tmux, no screen, no external runtime.
 - **Survives disconnects** — shells and running processes persist across drops.
-- **Reconnect wrappers** — `aether ssh host` runs OpenSSH in a reconnect loop;
-  `aether-connect host` or `aether ts host` runs Tailscale SSH through the
-  `tailscale` CLI and does not require `sshd` on the remote host. Both pass a
-  stable client ID to the remote side and reattach that terminal to its original
-  session after a transport drop.
+- **Reconnect wrappers** — `aether ssh host` runs the standard OpenSSH client
+  in a reconnect loop; `aether-connect host` or `aether ts host` runs Tailscale
+  SSH through the `tailscale` CLI and does not require `sshd` on the remote
+  host. Both pass a stable client ID to the remote side and reattach that
+  terminal to its original session after a transport drop.
 - **Remote-only** — only *remote* (SSH/Tailscale SSH) interactive logins are
   intercepted. A local **console or serial login is never touched** — it falls
   straight through to a normal shell. The login shell stays `/bin/bash`; a
@@ -94,10 +94,10 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   stdin/stdout ←→ PTY ←→ /bin/bash (persistent)
 ```
 
-- **`aether ssh` / `aether connect`** — local SSH wrapper. It generates one
-  stable `AETHERSHELL_CLIENT_ID` per wrapper process, runs SSH with keepalive
-  settings, filters expected broken-pipe noise, and reconnects with the same
-  client ID after transport failure.
+- **`aether ssh` / `aether connect`** — local OpenSSH client wrapper. It
+  generates one stable `AETHERSHELL_CLIENT_ID` per wrapper process, runs `ssh`
+  with keepalive settings, filters expected broken-pipe noise, and reconnects
+  with the same client ID after transport failure.
 - **`aether ts` / `aether tailscale` / `aether tailscale-ssh`** — local
   Tailscale SSH wrapper. It invokes `tailscale ssh`, so the remote machine only
   needs Tailscale SSH enabled; a normal OpenSSH server does not need to be
@@ -106,12 +106,12 @@ No tmux. No screen. Just a lightweight Go daemon managing PTYs.
   It does not start or talk to a local `aetherd`; it only runs the reconnecting
   transport and asks the remote host to run `aether --login`. By default,
   `aether-connect host` uses Tailscale SSH. Use `aether-connect ssh host` for
-  OpenSSH. When Tailscale is in use, a short hostname is resolved to its
-  Tailscale IP automatically (so `aether-connect ssh cosmo` works without
-  MagicDNS configured for plain OpenSSH); for non-Tailscale hosts the
-  destination is passed through unchanged. Tailscale SSH does not expose
-  OpenSSH's forced-TTY flag for remote commands, so the connector runs the
-  remote login through `script(1)` to provide the PTY that aether requires.
+  the standard OpenSSH client. When Tailscale is in use, a short hostname is
+  resolved to its Tailscale IP automatically (so `aether-connect ssh cosmo`
+  works without MagicDNS configured for plain OpenSSH); for non-Tailscale
+  hosts the destination is passed through unchanged. Tailscale SSH does not
+  expose OpenSSH's forced-TTY flag for remote commands, so the connector runs
+  the remote login through `script(1)` to provide the PTY that aether requires.
 - **`aether`** — invoked for remote logins by the `/etc/profile.d/aether.sh`
   hook (login shell stays `/bin/bash`) or explicitly by the reconnect wrapper.
   Detects interactive vs non-interactive and remote vs local use, connects to
