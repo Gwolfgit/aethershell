@@ -236,9 +236,11 @@ func insideSession() bool {
 // determined (e.g. stdin is not a pts).
 func currentTTY() string {
 	for _, fd := range []string{"0", "1", "2"} {
-		if l, err := os.Readlink("/proc/self/fd/" + fd); err == nil {
-			if strings.HasPrefix(l, "/dev/pts/") {
-				return strings.TrimPrefix(l, "/dev/")
+		for _, base := range []string{"/proc/self/fd/", "/dev/fd/"} {
+			if l, err := os.Readlink(base + fd); err == nil {
+				if strings.HasPrefix(l, "/dev/pts/") || strings.HasPrefix(l, "/dev/tty") {
+					return strings.TrimPrefix(l, "/dev/")
+				}
 			}
 		}
 	}

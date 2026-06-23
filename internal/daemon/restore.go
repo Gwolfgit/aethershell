@@ -25,6 +25,7 @@ type restoreSession struct {
 	LastUnix    int64    `json:"last_unix"`
 	ShellPID    int      `json:"shell_pid"`
 	ShellStart  uint64   `json:"shell_start,omitempty"` // /proc starttime; PID-reuse guard
+	SlaveName   string   `json:"slave_name,omitempty"`
 	Geometry    Geometry `json:"geometry"`
 	PTYFD       int      `json:"pty_fd"`
 }
@@ -89,6 +90,7 @@ func Restore(socketPath, statePath string) (*Server, net.Listener, error) {
 			ClientID:     meta.ClientID,
 			LastAttached: time.Unix(0, meta.LastUnix),
 			pty:          ptyFile,
+			slaveName:    meta.SlaveName,
 			shellPid:     meta.ShellPID,
 			shellStart:   meta.ShellStart,
 			geo:          meta.Geometry,

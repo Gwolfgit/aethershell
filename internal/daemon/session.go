@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/Gwolfgit/aethershell/internal/proto"
 	"github.com/creack/pty"
-	"golang.org/x/sys/unix"
 )
 
 // Session wraps a PTY-backed shell process.
@@ -24,6 +24,7 @@ type Session struct {
 	LastAttached time.Time
 	cmd          *exec.Cmd
 	pty          *os.File // PTY master fd; kept open so shell survives client detach
+	slaveName    string   // slave tty path, e.g. /dev/pts/5 or /dev/ttys003
 	shellPid     int
 	shellStart   uint64            // /proc/<pid>/stat starttime; detects PID reuse after restore
 	connEnv      map[string]string // forwarded connection env (TERM, LANG, LC_*, SSH_*); reused on restart
@@ -131,17 +132,58 @@ func buildSessionEnv(name, clientID string, geo Geometry, connEnv map[string]str
 	return out
 }
 
+func shellPath() string {
+	if sh := os.Getenv("SHELL"); filepath.IsAbs(sh) {
+		if st, err := os.Stat(sh); err == nil && !st.IsDir() {
+			return sh
+		}
+	}
+	for _, sh := range []string{"/bin/bash", "/usr/local/bin/bash", "/bin/sh"} {
+		if st, err := os.Stat(sh); err == nil && !st.IsDir() {
+			return sh
+		}
+	}
+	return "/bin/sh"
+}
+
+func startShellInPTY(cmd *exec.Cmd, geo Geometry) (*os.File, string, error) {
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		return nil, "", err
+	}
+	defer tty.Close()
+
+	if err := pty.Setsize(ptmx, &pty.Winsize{
+		Rows: uint16(geo.Rows), Cols: uint16(geo.Cols),
+		X: uint16(geo.XPixel), Y: uint16(geo.YPixel),
+	}); err != nil {
+		ptmx.Close()
+		return nil, "", err
+	}
+
+	cmd.Stdin = tty
+	cmd.Stdout = tty
+	cmd.Stderr = tty
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+	}
+
+	if err := cmd.Start(); err != nil {
+		ptmx.Close()
+		return nil, "", err
+	}
+	return ptmx, tty.Name(), nil
+}
+
 // NewSession starts a shell in a new PTY and returns the session.
 func NewSession(name string, geo Geometry, clientID string, connEnv map[string]string) (*Session, error) {
 	geo = geo.normalize()
 
-	cmd := exec.Command("/bin/bash")
+	cmd := exec.Command(shellPath())
 	cmd.Env = buildSessionEnv(name, clientID, geo, connEnv)
 
-	f, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Rows: uint16(geo.Rows), Cols: uint16(geo.Cols),
-		X: uint16(geo.XPixel), Y: uint16(geo.YPixel),
-	})
+	f, slaveName, err := startShellInPTY(cmd, geo)
 	if err != nil {
 		return nil, fmt.Errorf("pty start: %w", err)
 	}
@@ -155,6 +197,7 @@ func NewSession(name string, geo Geometry, clientID string, connEnv map[string]s
 		LastAttached: now,
 		cmd:          cmd,
 		pty:          f,
+		slaveName:    slaveName,
 		shellPid:     cmd.Process.Pid,
 		shellStart:   start,
 		connEnv:      connEnv,
@@ -220,11 +263,10 @@ func (s *Session) Resize(geo Geometry) error {
 // session, or "" if it can't be determined. Used to exclude the daemon's own
 // PTYs from external-session discovery.
 func (s *Session) PtsName() string {
-	n, err := unix.IoctlGetInt(int(s.pty.Fd()), unix.TIOCGPTN)
-	if err != nil {
-		return ""
+	if s.slaveName == "" && s.pty != nil {
+		s.slaveName = ptySlaveName(s.pty)
 	}
-	return "pts/" + fmt.Sprint(n)
+	return normalizeTTYName(s.slaveName)
 }
 
 // IsAlive reports whether the session's shell process is still usable.
@@ -343,19 +385,21 @@ func (s *Session) Kill() {
 }
 
 // RestartShell kills the current shell process inside the PTY and starts a new one.
-// The PTY master fd remains open; the old process is reaped and a fresh bash is spawned.
+// The PTY master fd remains open; the old process is reaped and a fresh shell is spawned.
 func (s *Session) RestartShell() error {
 	// Open the new slave BEFORE killing the old shell so at least one slave fd
 	// stays open the whole time. Otherwise the brief window with no slave open
 	// makes the PTY master read return EIO, tearing down the drain loop.
-	ptsNum, err := unix.IoctlGetInt(int(s.pty.Fd()), unix.TIOCGPTN)
-	if err != nil {
-		return fmt.Errorf("ioctl TIOCGPTN: %w", err)
+	slaveName := s.slaveName
+	if slaveName == "" && s.pty != nil {
+		slaveName = ptySlaveName(s.pty)
 	}
-	slavePath := fmt.Sprintf("/dev/pts/%d", ptsNum)
-	slave, err := os.OpenFile(slavePath, os.O_RDWR, 0)
+	if slaveName == "" {
+		return fmt.Errorf("pty slave name unavailable")
+	}
+	slave, err := os.OpenFile(slaveName, os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("open pty slave %s: %w", slavePath, err)
+		return fmt.Errorf("open pty slave %s: %w", slaveName, err)
 	}
 	defer slave.Close()
 
@@ -364,7 +408,7 @@ func (s *Session) RestartShell() error {
 
 	// Start a new shell connected to the PTY slave, reusing the same connection
 	// environment the session was created with so a restart stays consistent.
-	cmd := exec.Command("/bin/bash")
+	cmd := exec.Command(shellPath())
 	cmd.Env = buildSessionEnv(s.Name, s.ClientID, s.geo, s.connEnv)
 	cmd.Stdin = slave
 	cmd.Stdout = slave
@@ -372,7 +416,6 @@ func (s *Session) RestartShell() error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  true,
 		Setctty: true,
-		Ctty:    int(slave.Fd()),
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -381,6 +424,7 @@ func (s *Session) RestartShell() error {
 	s.cmd = cmd
 	s.shellPid = cmd.Process.Pid
 	s.shellStart, _ = procStartTicks(cmd.Process.Pid)
+	s.slaveName = slaveName
 	return nil
 }
 

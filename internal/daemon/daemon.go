@@ -789,6 +789,7 @@ func (s *Server) prepareUpgrade() (string, *os.File, error) {
 			LastUnix:    lastAttached.UnixNano(),
 			ShellPID:    sess.shellPid,
 			ShellStart:  sess.shellStart,
+			SlaveName:   sess.slaveName,
 			Geometry:    geo,
 			PTYFD:       int(sess.pty.Fd()),
 		})
